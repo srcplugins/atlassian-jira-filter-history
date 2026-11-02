@@ -1,0 +1,417 @@
+# Shared srcplugins file, synchronized across repositories.
+name: Hosted
+
+# Hosted suites (forge-test.mjs): deploy this commit to the Forge development environment,
+# upgrade the owned site's installation, then the suite's unattended journeys and runners. A push
+# to `dev` (any branch but main) runs the features suite; a "Hosted: <choice>" line in its commit message
+# picks another: full, none, or comma-separated step names (the full suite's prerequisites and the
+# steps whose names contain them, for example "Hosted: bulk, rovo"). A push to `dev` whose head
+# commit carries a "Local-suite:" trailer naming that commit's own tree (the suite already passed
+# locally on exactly it, config/commit-gate.mjs) runs nothing. Marking a pull request ready
+# for review runs the full suite, and Publish runs the release suite. Site, accounts and evidence
+# stay private: values come from the `acceptance` environment's secrets and are masked, and
+# reports and journals are uploaded only age-encrypted. Setup:
+# https://github.com/srcplugins/atlassian-forge-test-framework/blob/main/docs/ci.md
+
+on:
+  push:
+    # Dependabot branches get no environment secrets, so the suite could not run there.
+    branches-ignore: [main, 'dependabot/**']
+    # A push that changes only what the offline Check reads (docs, its checkers, format and lint
+    # configuration, unit tests, the other workflows) skips the suite; Check still runs on it.
+    paths-ignore:
+      - '**.md'
+      - '.github/dependabot.yml'
+      - '.github/workflows/check.yml'
+      - '.github/workflows/security.yml'
+      - '.prettierignore'
+      - '.prettierrc.json'
+      - 'eslint.config.mjs'
+      - 'knip.config.js'
+      - 'config/check-licenses.mjs'
+      - 'config/check-plugin.mjs'
+      - 'config/eslint-local-rules.mjs'
+      - 'config/forge-eslint.mjs'
+      # Publish runs the production smoke; no hosted suite reads it.
+      - 'config/production-smoke.mjs'
+      - 'tests/hosted/production-smoke.mjs'
+      - 'tests/*.test.mjs'
+  pull_request:
+    types: [ready_for_review]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Hosted suite
+        type: choice
+        options: [full, features]
+        default: full
+      only:
+        description: >-
+          Optional: comma-separated step names; runs the suite's prerequisites and the steps whose
+          names contain them
+        required: false
+        default: ''
+      cleanup:
+        description: >-
+          Instead of the suite, after inspecting a failed run: one guarded cleanup as "<target> <run-uuid>".
+          The target is a runner listed in tests/hosted/cleanup.json or a fixture app for
+          "npx forge-test cleanup", for example "native-prompt-links <run-uuid>"
+        required: false
+        default: ''
+  # Publish runs the release suite on the build it attested.
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      deploy_tag:
+        type: string
+        required: true
+      suite:
+        type: string
+        default: release
+
+permissions:
+  contents: read
+  actions: read
+
+# An explicit bash adds pipefail: a failed command inside a pipe fails its step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # A release commit changes package.json's version, which no deployed code reads, so a push whose
+  # other changes are all ones paths-ignore lists starts no suite either; Publish tests the build.
+  scope:
+    name: Changes
+    if: github.event_name == 'push'
+    runs-on: ${{ github.event.repository.private && 'px-0' || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    outputs:
+      version_only: ${{ steps.scope.outputs.version_only }}
+      has_suite: ${{ steps.suite.outputs.has_suite }}
+      passed_locally: ${{ steps.local.outputs.passed_locally }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Only the version changed
+        id: scope
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # The same list as paths-ignore above; a test keeps them equal.
+          ignored=('**.md' .github/dependabot.yml .github/workflows/check.yml
+            .github/workflows/security.yml .prettierignore .prettierrc.json eslint.config.mjs
+            knip.config.js config/check-licenses.mjs config/check-plugin.mjs
+            config/eslint-local-rules.mjs config/forge-eslint.mjs config/production-smoke.mjs
+            tests/hosted/production-smoke.mjs 'tests/*.test.mjs')
+          # paths-ignore's * stops at a slash and ** doesn't; bash's * never stops, so count them.
+          skipped() {
+            local pattern
+            for pattern in "${ignored[@]}"; do
+              # shellcheck disable=SC2053
+              [[ "$1" == $pattern ]] || continue
+              [[ "$pattern" == *'**'* || "${1//[^\/]/}" == "${pattern//[^\/]/}" ]] && return 0
+            done
+            return 1
+          }
+          # The same JSON with the root version removed (the lockfile also records it for "").
+          same() {
+            local filter='del(.version) | if .packages? then del(.packages[""].version) else . end'
+            [ "$(git show "$BEFORE:$1" | jq -S "$filter")" = "$(git show "$GITHUB_SHA:$1" | jq -S "$filter")" ]
+          }
+          only=false
+          # A new branch, or a push whose previous commit isn't here, runs the suite.
+          if [[ "$BEFORE" =~ ^[0-9a-f]{40}$ && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2> /dev/null; then
+            only=true
+            changed=$(git diff --name-only --no-renames "$BEFORE" "$GITHUB_SHA")
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              case "$file" in
+                package.json | package-lock.json)
+                  git cat-file -e "$BEFORE:$file" 2> /dev/null && git cat-file -e "$GITHUB_SHA:$file" 2> /dev/null &&
+                    same "$file" || only=false ;;
+                *) skipped "$file" || only=false ;;
+              esac
+            done <<< "$changed"
+          fi
+          echo "version_only=$only" >> "$GITHUB_OUTPUT"
+          [ "$only" = false ] || echo "Only the version changed: no hosted suite; Publish tests the build." >> "$GITHUB_STEP_SUMMARY"
+      # A new plugin has no hosted suite until its first features are built.
+      - name: Has a hosted suite
+        id: suite
+        run: |
+          if [ -f forge-test.mjs ]; then
+            echo "has_suite=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_suite=false" >> "$GITHUB_OUTPUT"
+            echo "No hosted suite yet (no forge-test.mjs): nothing to run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # `npm run hosted -- features` (or full) records the tree a whole suite passed on locally,
+      # and committing exactly that tree on dev adds the trailer. Only `dev` honors it: the real
+      # repositories have no dev, so a landing, its ready pull request and Publish always run. An
+      # explicit "Hosted:" line keeps its choice, and a trailer whose tree isn't this commit's
+      # (a rebase, an amend outside the hook, a hand-written one) is ignored.
+      - name: Passed locally on this tree
+        id: local
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          tree=$(git rev-parse "$GITHUB_SHA^{tree}")
+          passed=$(printf '%s\n' "$MESSAGE" | sed -nE 's/^Local-suite: (features|full) passed on tree ([0-9a-f]{40})( .*)?$/\2/p' | tail -n 1)
+          local=false
+          if [ "$GITHUB_REF_NAME" = dev ] && [ -n "$passed" ] && [ "$passed" = "$tree" ] &&
+            [[ $'\n'"$MESSAGE" != *$'\n'Hosted:* ]]; then
+            local=true
+            echo "The suite passed locally on this commit's tree $tree: no hosted run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "passed_locally=$local" >> "$GITHUB_OUTPUT"
+
+  hosted:
+    name: Hosted suite
+    needs: scope
+    # Pull requests from forks get no environment secrets. Runs that aren't pushes skip `scope`.
+    if: >-
+      !cancelled() && needs.scope.result != 'failure' && needs.scope.outputs.version_only != 'true' &&
+      needs.scope.outputs.has_suite != 'false' && needs.scope.outputs.passed_locally != 'true' &&
+      !contains(github.event.head_commit.message, 'Hosted: none') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    # The self-hosted px-0 runners while the repository is private; GitHub-hosted once it is
+    # public and for Publish's release suite.
+    runs-on: ${{ github.event.repository.private && !inputs.deploy_tag && 'px-0' || 'ubuntu-24.04' }}
+    timeout-minutes: 180
+    environment: acceptance
+    # Queued, never cancelled: a started run must finish its own cleanup.
+    concurrency:
+      group: hosted-primary-site
+      cancel-in-progress: false
+    env:
+      CI: 'true'
+      CLEANUP: ${{ inputs.cleanup }}
+      DEPLOY_TAG: ${{ inputs.deploy_tag }}
+    steps:
+      - name: Choose the suite
+        env:
+          EVENT: ${{ github.event_name }}
+          MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_ONLY: ${{ inputs.only }}
+        run: |
+          suite=${INPUT_SUITE:-full}
+          only=$INPUT_ONLY
+          if [ "$EVENT" = push ]; then
+            suite=features
+            choice=$(printf '%s\n' "$MESSAGE" | sed -n 's/^Hosted: *//p' | tail -n 1)
+            case "$choice" in
+              '' | features) ;;
+              full) suite=full ;;
+              *) suite=full only=$choice ;;
+            esac
+          fi
+          [[ "$only" =~ ^[A-Za-z0-9\ ,:-]*$ ]] || { echo "::error::Step names may use letters, digits, spaces, commas, colons and hyphens"; exit 1; }
+          echo "SUITE=$suite" >> "$GITHUB_ENV"
+          echo "ONLY=$only" >> "$GITHUB_ENV"
+          echo "Suite: $suite${only:+ (only $only)}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+          OWNER: ${{ vars.SRCPLUGINS_REPO_OWNER }}
+          PREFIX: ${{ vars.SRCPLUGINS_REPO_PREFIX }}
+        run: |
+          base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
+          git config --global url."$base".insteadOf ssh://git@github.com/
+          # A development copy sets these repository variables to read its sibling copies:
+          # srcplugins/<name> then resolves to <owner>/<prefix><name>.
+          [ -n "$OWNER$PREFIX" ] || exit 0
+          [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
+            { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }
+          for from in ssh://git@github.com/srcplugins/ https://github.com/srcplugins/; do
+            git config --global --add url."$base${OWNER:-srcplugins}/$PREFIX".insteadOf "$from"
+          done
+          echo "srcplugins repositories resolve to ${OWNER:-srcplugins}/$PREFIX<name>"
+      - name: Install dependencies
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+          sudo apt-get update > /dev/null
+          sudo apt-get install -y --no-install-recommends age unzip > /dev/null
+          # The self-hosted runner image lacks what GitHub's image ships: Google Chrome and gh.
+          command -v google-chrome > /dev/null || npx playwright install --with-deps chrome > /dev/null
+          if ! command -v gh > /dev/null; then
+            gh=gh_2.102.0_linux_amd64
+            curl -fsSLo "$RUNNER_TEMP/gh.tgz" "https://github.com/cli/cli/releases/download/v2.102.0/$gh.tar.gz"
+            echo "bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386  $RUNNER_TEMP/gh.tgz" | sha256sum -c --quiet
+            sudo tar -xzf "$RUNNER_TEMP/gh.tgz" -C /usr/local --strip-components=1 "$gh/bin/gh"
+          fi
+      # During development the test framework may follow a branch: test that branch's latest
+      # commit rather than the one the lockfile recorded. A release pins a tag or commit.
+      - name: Test framework version
+        run: |
+          spec=$(node -p "require('./package.json').devDependencies['@srcplugins/atlassian-forge-test-framework'] ?? ''")
+          ref=${spec#*#}
+          repo=${spec#github:}
+          repo=${repo%%#*}
+          if [[ "$spec" != github:*#* || "$ref" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})$ ]]; then
+            echo "Test framework: $spec"
+            exit 0
+          fi
+          [ -z "$DEPLOY_TAG" ] || { echo "::error::A release must pin the test framework to a tag or commit"; exit 1; }
+          sha=$(git ls-remote --exit-code "ssh://git@github.com/$repo.git" "refs/heads/$ref" | cut -f1)
+          npm install --no-save --no-audit --no-fund "git+ssh://git@github.com/$repo.git#$sha"
+          echo "Test framework: $ref at $sha"
+      # Site configuration and credentials are scoped to the steps that use them, never to
+      # the install step.
+      - name: Restore sessions and mask private values
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_SESSION_ADMIN: ${{ secrets.JIRA_SESSION_ADMIN }}
+          JIRA_SESSION_ADMIN2: ${{ secrets.JIRA_SESSION_ADMIN2 }}
+          JIRA_SESSION_MEMBER: ${{ secrets.JIRA_SESSION_MEMBER }}
+          JIRA_SESSION_RESTRICTED: ${{ secrets.JIRA_SESSION_RESTRICTED }}
+          JIRA_IDENTITY_FIXTURE: ${{ secrets.JIRA_IDENTITY_FIXTURE }}
+        run: |
+          npx forge-test mask
+          npx forge-test restore
+          npx forge-test mask
+      # Run journals carry fixture ownership between runs, encrypted to the maintainers' keys and
+      # this workflow. An unresolved journal makes the next run refuse instead of ignoring
+      # leftovers.
+      - name: Restore run journals
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
+          OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
+          AGENT: ${{ vars.AGENT_AGE_RECIPIENT }}
+          REPO_ID: ${{ github.repository_id }}
+        run: |
+          # Fail before the suite if this run's journals could not be encrypted afterwards.
+          [ -n "$OWNER" ] || { echo "::error::OWNER_AGE_RECIPIENT is not set"; exit 1; }
+          printf x | age -r "$OWNER" > /dev/null || { echo "::error::OWNER_AGE_RECIPIENT is not an age recipient"; exit 1; }
+          [ -z "$AGENT" ] || printf x | age -r "$AGENT" > /dev/null || { echo "::error::AGENT_AGE_RECIPIENT is not an age recipient"; exit 1; }
+          # The API doesn't list newest first and pages at 100; runs are serial, so the newest
+          # unexpired state is current. Any workflow run can upload an artifact of this name,
+          # including a fork's pull request, so only runs of this repository's own code count.
+          # gh refuses --slurp with its own --jq, so the merged pages go through jq.
+          found=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-state&per_page=100" |
+            jq -r --argjson repo "$REPO_ID" '[.[].artifacts[]
+              | select((.expired | not) and .workflow_run.repository_id == $repo
+                       and .workflow_run.head_repository_id == $repo)]
+              | max_by(.created_at) // empty | "\(.id) \(.workflow_run.id)"')
+          if [ -z "$found" ]; then echo "::warning::No earlier run journals; starting without them."; exit 0; fi
+          read -r id run <<< "$found"
+          # Only this workflow writes the state, directly or called by Publish.
+          path=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq .path)
+          [[ "$path" =~ ^\.github/workflows/(hosted|publish)\.yml(@.*)?$ ]] ||
+            { echo "::error::Run journals in artifact $id came from another workflow."; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/state.zip"
+          unzip -o -q "$RUNNER_TEMP/state.zip" -d "$RUNNER_TEMP/state"
+          archive="$RUNNER_TEMP/journals.tgz"
+          age -d -i <(printf '%s' "$CI_AGE_KEY") "$RUNNER_TEMP/state/journals.tar.age" > "$archive"
+          # Only regular files at the paths "Encrypt journals and evidence" archives. No pipes into
+          # grep -q here: under pipefail, its early exit could make a found entry look like none.
+          listing=$(tar -tvzf "$archive")
+          members=$(tar -tzf "$archive")
+          if [ -n "$(grep -v '^-' <<< "$listing")" ] ||
+            [ -n "$(grep -Ev '^sites/[^/]+/e2e/[^/]*runs/[^/]+\.json$' <<< "$members")" ] ||
+            grep -q '\.\.' <<< "$members"; then
+            echo "::error::Run journals in artifact $id hold unexpected entries."; exit 1
+          fi
+          tar -xzf "$archive" -C .local --no-same-owner --no-same-permissions
+          echo "Restored run journals from artifact $id."
+      - name: Forge CLI settings
+        # The guarded wrapper requires credentials for every Forge command.
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        run: node config/forge.mjs settings set usage-analytics false
+      - name: Deploy the published build to development
+        if: env.DEPLOY_TAG != ''
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        run: node config/forge.mjs deploy --tag "$DEPLOY_TAG" -e development --non-interactive
+      - name: Hosted suite
+        if: env.CLEANUP == ''
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          # The real repository's runs (landings and releases) go first on the site; a development
+          # copy (it sets these variables) pauses its suite between steps for them.
+          FORGE_TEST_LEASE_PRIORITY: ${{ vars.SRCPLUGINS_REPO_OWNER == '' && vars.SRCPLUGINS_REPO_PREFIX == '' && '1' || '0' }}
+        # A failed lane or runner cleans up through its declared cleanup and the suite moves on;
+        # a cleanup that refuses stops it, leaving the journal for "cleanup" above.
+        run: npx forge-test suite "$SUITE" ${ONLY:+--only "$ONLY"}
+      - name: Guarded cleanup of a failed run
+        if: env.CLEANUP != ''
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        # A plugin lists its own runners' cleanup in tests/hosted/cleanup.json:
+        # { "<target>": { "command": ["node", "<runner>", "cleanup"], "env": { "NAME": "value" } } }.
+        # The run UUID is appended to the command. Any other target is a fixture app.
+        run: |
+          [[ "$CLEANUP" =~ ^([a-z][a-z0-9-]*)\ ([0-9a-f-]{36})$ ]] ||
+            { echo "::error::Expected \"<target> <run-uuid>\""; exit 1; }
+          target=${BASH_REMATCH[1]}
+          run=${BASH_REMATCH[2]}
+          runners=tests/hosted/cleanup.json
+          if [ -f "$runners" ] && jq -e --arg t "$target" 'has($t)' "$runners" > /dev/null; then
+            command=()
+            while IFS= read -r part; do command+=("$part"); done < <(jq -r --arg t "$target" '.[$t].command[]' "$runners")
+            while IFS= read -r variable; do
+              # Plain opt-in flags only; never credentials, Forge guards or the toolchain.
+              [[ "$variable" =~ ^[A-Z][A-Z0-9_]*=[^[:space:]]*$ && ! "$variable" =~ ^(FORGE_|JIRA_|GITHUB_|RUNNER_|NODE_|NPM_|PATH=) ]] ||
+                { echo "::error::Unsupported environment entry for $target"; exit 1; }
+              export "$variable"
+            done < <(jq -r --arg t "$target" '.[$t].env // {} | to_entries[] | "\(.key)=\(.value)"' "$runners")
+            [ "${#command[@]}" -gt 0 ] || { echo "::error::No cleanup command for $target"; exit 1; }
+            "${command[@]}" "$run"
+          else
+            npx forge-test cleanup "$target" "$run"
+          fi
+      - name: Encrypt journals and evidence
+        if: always() && steps.state.outcome == 'success'
+        env:
+          CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
+          OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
+          AGENT: ${{ vars.AGENT_AGE_RECIPIENT }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          ci=$(age-keygen -y <(printf '%s' "$CI_AGE_KEY"))
+          # The maintainers' keys can read both archives.
+          readers=(-r "$OWNER")
+          [ -z "$AGENT" ] || readers+=(-r "$AGENT")
+          cd .local
+          find sites -path '*/e2e/*runs/*.json' > "$RUNNER_TEMP/journals.txt"
+          tar -czf - -T "$RUNNER_TEMP/journals.txt" | age "${readers[@]}" -r "$ci" > "$RUNNER_TEMP/out/journals.tar.age"
+          find sites \( -name '*-report.json' -o -path '*-results/*' -o -path '*/e2e/*runs/*.png' -o -path '*/e2e/*runs/*.txt' \) -type f \
+            > "$RUNNER_TEMP/evidence.txt"
+          tar -czf - -T "$RUNNER_TEMP/evidence.txt" | age "${readers[@]}" > "$RUNNER_TEMP/out/evidence.tar.age"
+      - name: Save run journals
+        if: always() && steps.state.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-state
+          path: ${{ runner.temp }}/out/journals.tar.age
+          retention-days: 90
+      - name: Save evidence (maintainers' keys only)
+        if: always() && steps.state.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-evidence
+          path: ${{ runner.temp }}/out/evidence.tar.age
+          retention-days: 14

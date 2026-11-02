@@ -1,0 +1,333 @@
+# Shared srcplugins file, synchronized across repositories.
+name: Publish
+
+# Manual release to Forge production with verifiable provenance. Run it on main: it releases the
+# version in package.json from main's head (or the given commit on main), refusing a version
+# whose vX.Y.Z tag already exists. It uploads one Forge build tagged with the commit (stamped
+# into the app's settings page), attests that bundle, runs the release suite against exactly that
+# build on development, then deploys the same build to production, creates the vX.Y.Z tag on
+# that commit and writes the GitHub release notes. So a version is tagged only once it shipped:
+# a rehearsal, a rejected approval or a failed suite leaves no tag, and the fix reruns Publish
+# under the same version. By default it rehearses: set `production` to deploy. Uploading a build
+# needs a Forge role that can deploy production (the Developer role gets "Permission denied"), so
+# the build job uses the `production` environment's deploy account too: every run waits for the
+# owner's approval before building, and a production run waits again before deploying. After the
+# deploy, a read-only smoke checks the production installation on the primary owned site and adds
+# its outcome to the release notes; without a production target it reports skipped, never passed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full commit hash on main to release (leave empty for main's head)
+        required: false
+        default: ''
+      production:
+        description: Deploy the tested build to production (leave off to rehearse)
+        type: boolean
+        default: false
+      approve_major:
+        description: Approve a major version (scope or egress change) after reviewing the manifest diff
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# An explicit bash adds pipefail: a failed command inside a pipe fails its step.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Check, build and attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      build: ${{ steps.build.outputs.build }}
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+      attestation: ${{ steps.attest.outputs.attestation-url }}
+    steps:
+      - name: The run is on main
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Run Publish on main"; exit 1; }
+          [ -z "$COMMIT" ] || [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+            { echo "::error::commit must be a full commit hash"; exit 1; }
+      # A rerun keeps the dispatched commit: github.sha is main's head when the run started.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The commit is an untagged release on main
+        id: source
+        run: |
+          version=$(node -p "require('./package.json').version")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::package.json version must be X.Y.Z"; exit 1; }
+          tag="v$version"
+          git merge-base --is-ancestor HEAD origin/main || { echo "::error::The commit is not on main"; exit 1; }
+          # Publish creates the tag after the production deploy; one that exists already shipped.
+          ! git rev-parse -q --verify "refs/tags/$tag" > /dev/null ||
+            { echo "::error::$tag already exists: bump the version to release again"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+          OWNER: ${{ vars.SRCPLUGINS_REPO_OWNER }}
+          PREFIX: ${{ vars.SRCPLUGINS_REPO_PREFIX }}
+        run: |
+          base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
+          git config --global url."$base".insteadOf ssh://git@github.com/
+          # A development copy sets these repository variables to read its sibling copies:
+          # srcplugins/<name> then resolves to <owner>/<prefix><name>.
+          [ -n "$OWNER$PREFIX" ] || exit 0
+          [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
+            { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }
+          for from in ssh://git@github.com/srcplugins/ https://github.com/srcplugins/; do
+            git config --global --add url."$base${OWNER:-srcplugins}/$PREFIX".insteadOf "$from"
+          done
+          echo "srcplugins repositories resolve to ${OWNER:-srcplugins}/$PREFIX<name>"
+      - name: Install and check
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+          npm run check
+          node config/check-plugin.mjs --release
+      # Credentials are scoped to the Forge steps, never to the install and check steps.
+      - name: Upload one Forge build of the commit
+        id: build
+        env:
+          SHA: ${{ steps.source.outputs.sha }}
+          TAG: ${{ steps.source.outputs.tag }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        run: |
+          sed -i "s/^export const build = 'development';$/export const build = '${SHA::12}';/" src/build-info.ts
+          grep -q "'${SHA::12}'" src/build-info.ts || { echo "::error::Build stamp failed"; exit 1; }
+          build="$TAG-${SHA::12}-$GITHUB_RUN_ID"
+          node config/forge.mjs settings set usage-analytics false
+          node config/forge.mjs build --tag "$build" --inspect --non-interactive
+          tar -czf "$RUNNER_TEMP/forge-bundle.tgz" -C .forge inspect
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+      - name: Attest the uploaded bundle
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/forge-bundle.tgz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: forge-bundle
+          path: ${{ runner.temp }}/forge-bundle.tgz
+          retention-days: 90
+
+  test:
+    name: Release suite on the build
+    needs: build
+    # A called workflow gets only what the calling job grants; hosted.yml reads artifacts.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/hosted.yml
+    with:
+      # The commit that was built and attested, even if main moves meanwhile.
+      ref: ${{ needs.build.outputs.sha }}
+      deploy_tag: ${{ needs.build.outputs.build }}
+      suite: release
+    secrets: inherit
+
+  production:
+    name: Deploy the tested build to production
+    needs: [build, test]
+    if: inputs.production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    # The only job that writes the repository: the tag and the release notes, after the deploy.
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      SHA: ${{ needs.build.outputs.sha }}
+      BUILD: ${{ needs.build.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+          OWNER: ${{ vars.SRCPLUGINS_REPO_OWNER }}
+          PREFIX: ${{ vars.SRCPLUGINS_REPO_PREFIX }}
+        run: |
+          base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
+          git config --global url."$base".insteadOf ssh://git@github.com/
+          # A development copy sets these repository variables to read its sibling copies:
+          # srcplugins/<name> then resolves to <owner>/<prefix><name>.
+          [ -n "$OWNER$PREFIX" ] || exit 0
+          [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
+            { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }
+          for from in ssh://git@github.com/srcplugins/ https://github.com/srcplugins/; do
+            git config --global --add url."$base${OWNER:-srcplugins}/$PREFIX".insteadOf "$from"
+          done
+          echo "srcplugins repositories resolve to ${OWNER:-srcplugins}/$PREFIX<name>"
+      - name: Install
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+      - name: Deploy the same build to production
+        env:
+          FORGE_ALLOW_PRODUCTION: '1'
+          APPROVE_MAJOR: ${{ inputs.approve_major }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        run: |
+          node config/forge.mjs settings set usage-analytics false
+          approve=()
+          [ "$APPROVE_MAJOR" = "true" ] && approve=(--approve MAJOR_VERSION_RULE)
+          # Without approve_major, a major version stops here with the linter's reason.
+          node config/forge.mjs deploy --tag "$BUILD" -e production --non-interactive "${approve[@]}"
+      # A rerun after a failed later step finds its own tag; a tag on another commit stops it.
+      - name: Tag the deployed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+            --jq ".[] | select(.ref == \"refs/tags/$TAG\") | .object.sha")
+          if [ -z "$tagged" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" > /dev/null
+          elif [ "$tagged" != "$SHA" ]; then
+            echo "::error::$TAG already names $tagged, not the deployed commit $SHA"; exit 1
+          fi
+          echo "Tagged $SHA as $TAG."
+      - name: Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION: ${{ needs.build.outputs.attestation }}
+        run: |
+          notes="Deployed to Forge production from commit $SHA as build $BUILD. Build provenance: $ATTESTATION. Release changes are in CHANGELOG.md."
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$notes"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "$notes"
+          fi
+          echo "$TAG deployed to production as build $BUILD." >> "$GITHUB_STEP_SUMMARY"
+
+  smoke:
+    name: Production smoke on an owned site
+    needs: [build, production]
+    if: inputs.production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Read-only checks with the acceptance sessions; no production credentials, and no site lease
+    # (taking it would write). Forge upgrades every installation at once, so this is detection
+    # within minutes, not a staged rollout.
+    environment: acceptance
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      SHA: ${{ needs.build.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+          OWNER: ${{ vars.SRCPLUGINS_REPO_OWNER }}
+          PREFIX: ${{ vars.SRCPLUGINS_REPO_PREFIX }}
+        run: |
+          base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
+          git config --global url."$base".insteadOf ssh://git@github.com/
+          # A development copy sets these repository variables to read its sibling copies:
+          # srcplugins/<name> then resolves to <owner>/<prefix><name>.
+          [ -n "$OWNER$PREFIX" ] || exit 0
+          [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
+            { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }
+          for from in ssh://git@github.com/srcplugins/ https://github.com/srcplugins/; do
+            git config --global --add url."$base${OWNER:-srcplugins}/$PREFIX".insteadOf "$from"
+          done
+          echo "srcplugins repositories resolve to ${OWNER:-srcplugins}/$PREFIX<name>"
+      - name: Install
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+          sudo apt-get update > /dev/null
+          sudo apt-get install -y --no-install-recommends age > /dev/null
+          command -v google-chrome > /dev/null || npx playwright install --with-deps chrome > /dev/null
+      - name: Restore the admin session and mask private values
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_SESSION_ADMIN: ${{ secrets.JIRA_SESSION_ADMIN }}
+        run: |
+          npx forge-test mask
+          npx forge-test restore
+          npx forge-test mask
+      - name: Read-only checks of the production installation
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        run: EXPECT_BUILD="${SHA::12}" node config/production-smoke.mjs "$RUNNER_TEMP/production-smoke.json"
+      # Always, so a failed or crashed smoke is in the release notes too.
+      - name: Smoke result in the release notes
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          result="$RUNNER_TEMP/production-smoke.json"
+          line="Production smoke (read-only, owned site): FAILED: the smoke did not complete."
+          [ -s "$result" ] && line=$(jq -r .notes "$result")
+          body=$(gh release view "$TAG" --json body --jq .body)
+          gh release edit "$TAG" --notes "$body"$'\n\n'"$line"
+          echo "$line"
+      - name: Encrypt failure screenshots (maintainers' keys only)
+        id: evidence
+        if: failure()
+        env:
+          OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
+          AGENT: ${{ vars.AGENT_AGE_RECIPIENT }}
+        run: |
+          list="$RUNNER_TEMP/screenshots.txt"
+          find .local/sites -path '*/e2e/production-smoke/*.png' -type f > "$list" 2> /dev/null || true
+          [ -s "$list" ] || { echo "No screenshots."; exit 0; }
+          readers=(-r "$OWNER")
+          [ -z "$AGENT" ] || readers+=(-r "$AGENT")
+          mkdir -p "$RUNNER_TEMP/out"
+          tar -czf - -T "$list" | age "${readers[@]}" > "$RUNNER_TEMP/out/production-smoke.tar.age"
+      - name: Save failure screenshots
+        if: failure() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-smoke-evidence
+          path: ${{ runner.temp }}/out/production-smoke.tar.age
+          retention-days: 14
+          if-no-files-found: ignore

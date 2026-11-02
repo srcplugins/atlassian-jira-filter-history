@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "features": [
+    {
+      "id": "FH-01",
+      "behavior": "Each change to a saved filter is a version with its actor and time: the create, a JQL edit saved in Jira's own issue search, and three JQL edits within about a second, in edit order; overview, history and inline comparison on the global page",
+      "suite": "tests/hosted/filter-history.features.spec.mjs",
+      "fixture": "Journaled administrator filter shared with the identity space, editable by the member",
+      "assertion": "Independent filter reads give each JQL; the app's history lists exactly five versions newest first with the expected JQL, the administrator as actor, distinct descending change times within the edit window; overview row names the filter, owner and actor; the comparison shows the replaced and new label and no restore for the current version",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": [
+        "tests/service.test.mjs",
+        "tests/boundary.test.mjs",
+        "tests/client.test.mjs"
+      ]
+    },
+    {
+      "id": "FH-02",
+      "behavior": "A sharing-only change and a save without changes add no version",
+      "suite": "tests/hosted/filter-history.features.spec.mjs",
+      "fixture": "Journaled administrator filter shared with the identity space; a user share added for the restricted account",
+      "assertion": "Jira's sharing read shows the added share; after both events had time to arrive the history still holds one version, and the next real change is exactly the second",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/service.test.mjs"]
+    },
+    {
+      "id": "FH-03",
+      "behavior": "A member edits the administrator's filter through an edit share and is the version's actor; the member restores the first version after confirming; a restore after someone else changed the filter since the preview is refused",
+      "suite": "tests/hosted/filter-history.features.spec.mjs",
+      "fixture": "Journaled administrator filter shared with the identity space, editable by the member; the member's saved session",
+      "assertion": "Version actor is the member; after the restore Jira's filter has the first version's name, description and JQL with share and edit permissions unchanged, and the history's newest version is marked restored with the member as actor; the stale restore answers \"The filter changed since you opened it. Review it again.\" and Jira keeps the administrator's change",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/service.test.mjs", "tests/boundary.test.mjs"]
+    },
+    {
+      "id": "FH-04",
+      "behavior": "A user who can see but not edit a filter sees its history without a restore, and Jira refuses that user's direct update",
+      "suite": "tests/hosted/filter-history.features.spec.mjs",
+      "fixture": "Journaled administrator filter shared with the identity space; the restricted account's saved session",
+      "assertion": "The app reports the filter as not writable, shows the can't-edit note and no Restore button; a direct PUT as the restricted account is refused (400/401/403) and an independent read shows the filter unchanged",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/service.test.mjs", "tests/boundary.test.mjs"]
+    },
+    {
+      "id": "FH-05",
+      "behavior": "A member's private filter and its history are visible to the member only: the administrator and the restricted user see neither, also by a direct history request",
+      "suite": "tests/hosted/filter-history.features.spec.mjs",
+      "fixture": "Journaled private filter owned by the member; a journaled shared administrator filter for the others to open",
+      "assertion": "The member's history shows the version; Jira refuses the filter to the administrator and the restricted account; their overview leaves it out; their history request rewritten to its ID answers \"This filter isn't available to you.\"",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/service.test.mjs", "tests/boundary.test.mjs"]
+    },
+    {
+      "id": "FH-06",
+      "behavior": "In Jira's issue search with a saved filter open, the apps menu's Filter history opens that filter's versions in a modal; without a saved filter it asks for one",
+      "suite": "tests/hosted/filter-history.features.spec.mjs",
+      "fixture": "Journaled administrator filter shared with the identity space, with two versions",
+      "assertion": "The modal's history answer is for the open filter with both versions and its heading and two rows show; issue search without a saved filter shows \"Open a saved filter in Jira's search to see its history.\"",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/client.test.mjs"]
+    },
+    {
+      "id": "FH-07",
+      "behavior": "A deleted filter's history stays for its last owner, read-only under Deleted filters, and the owner recreates the filter from an earlier version as a new private filter that carries the history on; a Jira administrator sees deleted filters listed without a way in, deletes a deleted filter's history from the list and a visible filter's history from its screen, without changing Jira; a member gets no Delete history",
+      "suite": "tests/hosted/filter-history.features.spec.mjs",
+      "fixture": "Two journaled private filters of the member, deleted by the journey through the journal; the filter the app recreates, journaled before the recreate with the deleted filter's marker; a journaled administrator filter shared with the identity space",
+      "assertion": "The member's overview lists both deleted filters as openable and the administrator's lists them without a link, the restricted user's not at all, and a history request rewritten to the deleted filter's ID answers \"This filter isn't available to you.\" for both; the administrator's Delete history removes the other deleted filter from the member's list; the member's history of the deleted filter is read-only with both versions; the recreate answers a new filter ID whose independent read as the member has the first version's query, no share or edit permissions and is refused to the administrator; the new filter's history has three versions, the newest marked recreated by the member; a member's history of the shared filter has no Delete history; after the administrator's Delete history the screen is empty, the overview drops the filter and Jira's read of it is unchanged",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": [
+        "tests/service.test.mjs",
+        "tests/boundary.test.mjs",
+        "tests/client.test.mjs"
+      ]
+    }
+  ],
+  "manualJourneys": [],
+  "scriptedJourneys": [
+    {
+      "id": "FH-08",
+      "method": "runner",
+      "unattended": true,
+      "script": "tests/hosted/verify-rovo.mjs",
+      "optIn": "FH_ROVO_TESTS",
+      "command": "FH_ROVO_TESTS=1 node tests/hosted/verify-rovo.mjs run (the full and release suites of forge-test.mjs)",
+      "fixture": "Journaled administrator filter shared with the identity space and changed once; journaled private filter of the member",
+      "assertion": "The Filter History agent's answer for the shared filter quotes its latest JQL; for the member's private filter it reports it unavailable without any of its JQL; independent reads show both filters unchanged",
+      "cleanup": "journal-verified; node tests/hosted/verify-rovo.mjs cleanup <run>",
+      "version": "Unattended in the full and release suites",
+      "lowerLevelTests": ["tests/rovo.test.mjs"]
+    }
+  ]
+}
