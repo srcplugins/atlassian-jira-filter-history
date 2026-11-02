@@ -1,0 +1,9 @@
+{
+  "filters": {
+    "command": ["node", "tests/hosted/recover-filters.mjs", "cleanup"]
+  },
+  "rovo": {
+    "command": ["node", "tests/hosted/verify-rovo.mjs", "cleanup"],
+    "env": { "FH_ROVO_TESTS": "1" }
+  }
+}
