@@ -4,6 +4,7 @@ import { isRecord } from './shared/response.mjs';
 import type { CurrentFilter, Jira, Store } from './integration';
 import {
   changedFields,
+  clearedKey,
   deletedKey,
   expiryKey,
   expiryPrefix,
@@ -15,6 +16,7 @@ import {
   trashPrefix,
   versionKey,
   versionPrefix,
+  type Cleared,
   type Deleted,
   type Expiry,
   type Field,
@@ -41,10 +43,6 @@ const queryFields: Field[] = ['name', 'description', 'jql'];
 const unavailable = () => new UserError("This filter isn't available to you.");
 const busyRecreating = () =>
   new UserError('This filter is already being recreated. Try again in a minute.');
-const descriptionNotRecorded = (action: string) =>
-  new UserError(
-    `Jira didn't send this version's description (over 10,000 characters), so it can't be ${action}.`,
-  );
 
 /** Jira sends the change time as a string of epoch milliseconds; a number is accepted too. */
 const eventTime = (value: unknown) =>
@@ -92,7 +90,6 @@ const requireFilterId = (value: unknown) => {
 /** A stored version with the fields it changed against the version before it. */
 const withChanges = (version: Version, previous: Version | undefined) => ({
   ...version,
-  recreated: version.recreated === true,
   changed: previous ? changedFields(previous, version) : [],
 });
 
@@ -182,6 +179,18 @@ export function createService({
     return true;
   }
 
+  /**
+   * Moves the record of an earlier deleted history to a recreated filter, with the versions,
+   * unless the recreated filter's own history was deleted later.
+   */
+  async function moveCleared(from: string, to: string) {
+    const cleared = await store.get<Cleared>(clearedKey(from));
+    if (!cleared) return;
+    const later = await store.get<Cleared>(clearedKey(to));
+    if (!later || later.at < cleared.at) await store.set(clearedKey(to), cleared);
+    await store.delete(clearedKey(from));
+  }
+
   /** Deletes one page of a filter's versions; false when none are left. */
   async function deleteVersions(filterId: string) {
     const keys = (await store.list(versionPrefix(filterId), 100)).map(({ key }) => key);
@@ -200,9 +209,11 @@ export function createService({
       if (recreatedAs) {
         while (await moveVersions(filterId, recreatedAs));
         await trim(recreatedAs);
+        await moveCleared(filterId, recreatedAs);
       } else while (await deleteVersions(filterId));
       await store.delete(tombstone.trash);
     }
+    await store.delete(clearedKey(filterId));
     await store.delete(deletedKey(filterId));
   }
 
@@ -215,7 +226,8 @@ export function createService({
   /**
    * Creates the filter in Jira at most once per deleted filter: the recreate is claimed in storage
    * first, and a later call that finds an older claim without a result looks for the filter it
-   * made instead of creating another. Returns the new filter's ID.
+   * made instead of creating another: the first of the owner's filters with the claimed version's
+   * name and query made after the claim. Returns the new filter's ID.
    */
   async function createOnce(
     filterId: string,
@@ -241,14 +253,24 @@ export function createService({
       const made =
         claimed &&
         (await jira.ownFilters(claimed.name, viewer))
-          .filter((filter) => !changedFields(claimed, filter, queryFields).length)
-          .sort((a, b) => Number(b.id) - Number(a.id))[0];
+          .filter(
+            (filter) =>
+              BigInt(filter.id) > BigInt(claim.above) &&
+              !changedFields(claimed, filter, queryFields).length,
+          )
+          .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1))[0];
       if (made) return remember(made.id);
     }
+    // Jira's filter IDs only grow: any filter of the owner's with this name made after this one is
+    // the recreate's.
+    const above = (await jira.ownFilters(version.name, viewer)).reduce(
+      (highest, { id }) => (BigInt(id) > BigInt(highest) ? id : highest),
+      '0',
+    );
     const token = randomUUID();
     await store.set<Deleted>(kept.key, {
       ...unclaimed(kept.deleted),
-      recreating: { token, at: version.at, since: now() },
+      recreating: { token, at: version.at, since: now(), above },
     });
     if ((await store.get<Deleted>(kept.key))?.recreating?.token !== token) throw busyRecreating();
     const outcome = await jira.createFilter(version);
@@ -264,6 +286,10 @@ export function createService({
     return remember(outcome.id);
   }
 
+  /** When and by whom the filter's earlier history was last deleted, if it was. */
+  const cleared = async (filterId: string) =>
+    (await store.get<Cleared>(clearedKey(filterId))) ?? null;
+
   async function history(filterId: unknown, viewer: string): Promise<unknown> {
     const id = requireFilterId(filterId);
     const current = (await jira.visibleFilters([id])).get(id);
@@ -272,6 +298,7 @@ export function createService({
         filter: current,
         ...(await versionsOf(id, keptVersions)),
         deleted: null,
+        cleared: await cleared(id),
         admin: await jira.isAdmin(),
       };
     const kept = await deletedFilter(id);
@@ -283,7 +310,9 @@ export function createService({
       // and show the recreated filter.
       const recreatedAs = kept.deleted.recreatedAs;
       if (!recreatedAs) throw unavailable();
-      await forget(id, kept).catch(() => undefined);
+      await moveCleared(id, recreatedAs)
+        .then(() => forget(id, kept))
+        .catch(() => undefined);
       return history(recreatedAs, viewer);
     }
     return {
@@ -297,7 +326,12 @@ export function createService({
       },
       versions,
       more,
-      deleted: { at: kept.deleted.at, actor: kept.deleted.actor },
+      deleted: {
+        at: kept.deleted.at,
+        actor: kept.deleted.actor,
+        expires: kept.deleted.at + retention,
+      },
+      cleared: await cleared(id),
       admin: false,
     };
   }
@@ -332,6 +366,8 @@ export function createService({
         await store.delete(latestKey(filterId));
         return;
       }
+      // A change made before an administrator deleted the history stays deleted.
+      if (version.at < ((await cleared(filterId))?.at ?? 0)) return;
       const newest = await newestVersion(filterId);
       const isNew = !newest || version.at < newest.at || changedFields(newest, version).length > 0;
       if (tombstone) {
@@ -412,6 +448,7 @@ export function createService({
             at,
             actor,
             canOpen: owner === viewer,
+            expires: at + retention,
           })),
         deletedPartial: trash.length > overviewLimit,
         admin,
@@ -428,8 +465,11 @@ export function createService({
     async changes(filterId: unknown) {
       const filter = await visible(requireFilterId(filterId));
       const { versions, more } = await versionsOf(filter.id, 10);
+      const deleted = await cleared(filter.id);
       return {
         filter: { id: filter.id, name: filter.name },
+        // Changes before this weren't kept: an administrator deleted them.
+        historyDeleted: deleted && { at: new Date(deleted.at).toISOString(), actor: deleted.actor },
         changes: versions.map(
           ({
             at,
@@ -456,7 +496,8 @@ export function createService({
 
     /**
      * Writes a version's name, description and JQL back to the filter as the viewer, if the
-     * filter still matches what the viewer previewed. Never retried.
+     * filter still matches what the viewer previewed; a version without its description keeps the
+     * filter's. Never retried.
      */
     async restore(payload: unknown) {
       if (!isRecord(payload)) throw new UserError('Choose a version to restore.');
@@ -472,13 +513,16 @@ export function createService({
       const current = await visible(filterId);
       const version = await store.get<Version>(versionKey(filterId, payload.at));
       if (!version) throw new UserError('That version is no longer recorded.');
-      if (version.descriptionMissing) throw descriptionNotRecorded('restored');
       if (!current.isWritable) throw new UserError("You can't edit this filter in Jira.");
       if (changedFields(expected as Pick<CurrentFilter, Field>, current, queryFields).length)
         throw new UserError('The filter changed since you opened it. Review it again.');
-      if (!changedFields(version, current, queryFields).length)
+      // Jira didn't send this version's description: restore its name and JQL only.
+      const target = version.descriptionMissing
+        ? { ...version, description: current.description }
+        : version;
+      if (!changedFields(target, current, queryFields).length)
         throw new UserError('The filter already matches this version.');
-      const outcome = await jira.updateFilter(filterId, version);
+      const outcome = await jira.updateFilter(filterId, target);
       if (outcome.status === 'rejected')
         throw new UserError(`Jira refused the restore: ${outcome.message}`);
       if (outcome.status === 'uncertain')
@@ -503,7 +547,6 @@ export function createService({
       if (!newId) {
         const version = await store.get<Version>(versionKey(filterId, payload.at));
         if (!version) throw new UserError('That version is no longer recorded.');
-        if (version.descriptionMissing) throw descriptionNotRecorded('recreated');
         newId = await createOnce(filterId, kept, version, viewer);
       }
       const target = newId;
@@ -514,6 +557,7 @@ export function createService({
       try {
         // The created event records the new filter's first version; its latest key is left to it.
         await within(() => moveVersions(filterId, target), unfinished);
+        await moveCleared(filterId, target);
         await forget(filterId, kept);
         await trim(target);
       } catch {
@@ -524,13 +568,18 @@ export function createService({
 
     /**
      * Administrators: deletes a filter's recorded history from the app's storage. Jira isn't
-     * changed. A deleted filter's history can be deleted without opening it.
+     * changed. A filter in Jira keeps who deleted its history and when, written first so a delete
+     * that stops part way still leaves it; a deleted filter's history can be deleted without
+     * opening it, and without a trace, as nobody can see that filter any more.
      */
-    async deleteHistory(filterId: unknown) {
+    async deleteHistory(filterId: unknown, viewer: string) {
       const id = requireFilterId(filterId);
       if (!(await jira.isAdmin())) throw adminOnly();
       const kept = await deletedFilter(id);
-      if (!kept) await visible(id);
+      if (!kept) {
+        await visible(id);
+        await store.set<Cleared>(clearedKey(id), { at: now(), actor: viewer });
+      }
       await within(
         () => deleteVersions(id),
         () => new UserError('Part of this history was deleted. Try again to finish.'),

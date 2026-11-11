@@ -33,10 +33,10 @@ export async function answer(page, action, exercise, { timeout = 45_000 } = {}) 
   /** @type {any} The envelope, set by the response predicate. */
   let result;
   const response = page.waitForResponse(
-    async (response) => {
-      if (invocation(response.request())?.payload.call.functionKey !== action) return false;
+    async (candidate) => {
+      if (invocation(candidate.request())?.payload.call.functionKey !== action) return false;
       try {
-        const body = (await response.json())?.data?.invokeExtension?.response?.body;
+        const body = (await candidate.json())?.data?.invokeExtension?.response?.body;
         if (typeof body?.ok !== 'boolean') return false;
         result = body;
         return true;
@@ -162,7 +162,8 @@ export async function viewVersion(page, index) {
 export async function openSearchAction(page, filterId) {
   const path = filterId ? `/issues/?filter=${filterId}` : '/issues/?jql=';
   await page.goto(`${activeTarget().site}${path}`, { waitUntil: 'domcontentloaded' });
-  const item = page.getByRole('menuitem', { name: /^Filter history/ });
+  // Case-insensitive: Jira can keep showing a module's previous title for a while after a deploy.
+  const item = page.getByRole('menuitem', { name: /^Filter History/i });
   // Jira can paint the Apps button before its menu is ready; opening a menu writes nothing.
   await expect(async () => {
     if (!(await item.isVisible()))
@@ -171,3 +172,15 @@ export async function openSearchAction(page, filterId) {
   }).toPass({ timeout: 45_000, intervals: [1000] });
   return item;
 }
+
+/**
+ * Clicks the app's item from `openSearchAction`. Jira can re-render the Apps menu away just as the
+ * item shows (the item detaches), so the menu is reopened until the click lands; opening the app
+ * writes nothing.
+ */
+export const clickSearchAction = (page, item) =>
+  expect(async () => {
+    if (!(await item.isVisible()))
+      await page.getByRole('button', { name: 'Apps', exact: true }).last().click();
+    await item.click({ timeout: 3000 });
+  }).toPass({ timeout: 45_000, intervals: [1000] });

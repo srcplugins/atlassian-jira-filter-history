@@ -113,9 +113,16 @@ test('an unreadable permission answer fails the overview, never treated as not a
 });
 
 const deleted = { ...event(3000, 'type = Bug'), eventType: 'avi:jira:deleted:filter' };
+// The owner's filters named like the one recreated, read before the create and to adopt one.
+const ownPath =
+  '/rest/api/3/filter/search?filterName=Bugs&isSubstringMatch=true&accountId=owner&expand=description%2Cjql%2Cowner%2CisWritable&maxResults=100';
+const own = (...values) => ({
+  expect: { method: 'GET', path: ownPath },
+  body: { isLast: true, values },
+});
 
 test('recreate makes one exact POST of a private filter and moves the history to it', async () => {
-  const { sdk, storage, resolvers } = await handlers({
+  const { sdk, storage, resolvers } = await handlers(own({ ...filter, id: '10040' }), {
     status: 201,
     body: { id: 10050, name: 'Bugs' },
   });
@@ -130,6 +137,7 @@ test('recreate makes one exact POST of a private filter and moves the history to
   });
   assert.deepEqual(result, { ok: true, value: { filterId: '10050' } });
   assert.deepEqual(sdk.calls, [
+    read(ownPath),
     {
       actor: 'asUser',
       path: '/rest/api/3/filter',
@@ -150,6 +158,38 @@ test('recreate makes one exact POST of a private filter and moves the history to
   );
 });
 
+test("an identity in the payload never opens, lists or recreates another user's deleted filter", async () => {
+  const empty = { body: { isLast: true, values: [] } };
+  const { sdk, storage, resolvers } = await handlers(empty, admin(false), empty, admin(false));
+  await createFilterEventHandler({
+    ...sdk,
+    kvs: storage.kvs,
+    WhereConditions: storage.WhereConditions,
+  })(deleted);
+  const forged = { accountId: 'owner', viewer: 'owner', owner: 'owner', principal: 'owner' };
+  const as = (accountId) => ({ accountId });
+  const unavailable = { ok: false, error: "This filter isn't available to you." };
+  assert.deepEqual(
+    await resolvers.history({ context: as('other'), payload: { filterId: '10001', ...forged } }),
+    unavailable,
+  );
+  assert.deepEqual(
+    await resolvers.recreate({
+      context: as('other'),
+      payload: { filterId: '10001', at: 1000, ...forged },
+    }),
+    unavailable,
+  );
+  const listed = await resolvers.overview({ context: as('other'), payload: forged });
+  assert.deepEqual(listed.value.deleted, []);
+  // The owner, by the request's context, gets both.
+  const history = await resolvers.history({ context: as('owner'), payload: { filterId: '10001' } });
+  assert.equal(history.value.filter.id, '10001');
+  assert.equal((await resolvers.overview({ context: as('owner') })).value.deleted.length, 1);
+  assert.ok(sdk.calls.every(({ method }) => method === 'GET'));
+  sdk.assertDrained();
+});
+
 test("a refused recreate shows Jira's message; an unconfirmed one is never retried", async () => {
   const payload = { filterId: '10001', at: 1000 };
   const recreate = async (...responses) => {
@@ -161,7 +201,7 @@ test("a refused recreate shows Jira's message; an unconfirmed one is never retri
     })(deleted);
     return { sdk, result: await resolvers.recreate({ context: { accountId: 'owner' }, payload }) };
   };
-  const refused = await recreate({
+  const refused = await recreate(own(), {
     status: 400,
     body: { errors: { filterName: 'A filter with this name already exists.' } },
   });
@@ -175,10 +215,14 @@ test("a refused recreate shows Jira's message; an unconfirmed one is never retri
     { status: 201, body: {} },
     Error('private transport failure'),
   ]) {
-    const unsure = await recreate(failure, failure);
+    const unsure = await recreate(own(), failure, failure);
     assert.equal(unsure.result.ok, false);
     assert.match(unsure.result.error, /didn't confirm the new filter/);
-    assert.equal(unsure.sdk.calls.length, 1, 'a write is made once');
+    assert.equal(
+      unsure.sdk.calls.filter(({ method }) => method === 'POST').length,
+      1,
+      'a write is made once',
+    );
   }
 });
 
@@ -191,7 +235,9 @@ test('delete history checks the permission, then the filter, and changes nothing
     value: { deleted: true },
   });
   assert.deepEqual(sdk.calls, [read(adminPath), read(searchPath('10001'))]);
-  assert.deepEqual([...storage.data.keys()], []);
+  // Only who deleted the history and when stays, from the request's context.
+  assert.deepEqual([...storage.data.keys()], ['cleared:10001']);
+  assert.equal(storage.data.get('cleared:10001').actor, 'viewer');
   const denied = await handlers(admin(false));
   assert.deepEqual(
     await denied.resolvers.deleteHistory({ context, payload: { filterId: '10001' } }),
@@ -408,19 +454,13 @@ test('the overview searches 100 filters per request, in key order, plus one perm
 });
 
 test("a stalled recreate looks for the owner's filter by exact name before creating another", async () => {
-  const { sdk, storage, resolvers } = await handlers({
-    expect: {
-      method: 'GET',
-      path: '/rest/api/3/filter/search?filterName=Bugs&isSubstringMatch=true&accountId=owner&expand=description%2Cjql%2Cowner%2CisWritable&maxResults=100',
-    },
-    body: {
-      isLast: true,
-      values: [
-        { ...filter, id: '10060', name: 'Bugs copy' },
-        { ...filter, id: '10050', jql: 'type = Bug AND status = Open' },
-      ],
-    },
-  });
+  const { sdk, storage, resolvers } = await handlers(
+    own(
+      { ...filter, id: '10060', name: 'Bugs copy' },
+      { ...filter, id: '10050', jql: 'type = Bug AND status = Open' },
+      { ...filter, id: '10030', jql: 'type = Bug AND status = Open' },
+    ),
+  );
   await createFilterEventHandler({
     ...sdk,
     kvs: storage.kvs,
@@ -429,7 +469,7 @@ test("a stalled recreate looks for the owner's filter by exact name before creat
   const trash = storage.data.get('deleted:10001').trash;
   storage.data.set(trash, {
     ...storage.data.get(trash),
-    recreating: { token: 'earlier', at: 1000, since: 1 },
+    recreating: { token: 'earlier', at: 1000, since: 1, above: '10040' },
   });
   assert.deepEqual(
     await resolvers.recreate({

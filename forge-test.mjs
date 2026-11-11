@@ -6,6 +6,11 @@
 
 /** The guarded Forge CLI wrapper (only development without the owner's opt-in). */
 export const forge = ['node', 'config/forge.mjs'];
+/**
+ * What the hosted runs change, so other apps' runs can share the site: this app's installation
+ * and the saved filters its journeys create and journal. Nothing site-wide or account-wide.
+ */
+export const leaseUses = ['app:filter-history', 'jira:filters'];
 
 const step = (name, command, env = {}, more = {}) => ({ name, command, env, ...more });
 const prerequisite = (name, command) => step(name, command, {}, { prerequisite: true });

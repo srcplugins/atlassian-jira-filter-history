@@ -11,8 +11,8 @@ const appContext = () => {
   return { environmentType: c.environmentType, license: c.license };
 };
 export const handler = registerResolvers({ Resolver, appContext, ...sdk });
-// Recording continues without a license, so a lapsed site's history has no gap.
+// Without an active license Forge skips recording (`appIsLicensed` in the manifest), so a lapsed site's history has a gap.
 export const filterEvent = createFilterEventHandler(sdk);
-// Expiry runs without a license too: it follows the retention period, not the subscription.
+// Expiry is skipped without an active license too, and resumes with it.
 export const cleanup = createCleanupHandler(sdk);
 export const rovoChanges = createRovoAction({ appContext, ...sdk });

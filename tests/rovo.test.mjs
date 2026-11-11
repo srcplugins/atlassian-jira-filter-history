@@ -48,6 +48,7 @@ test('Rovo read checks the viewer can see the filter, then returns its recorded 
   assert.equal(result.ok, true);
   assert.deepEqual(result.value.filter, { id: '10001', name: 'Bugs' });
   assert.equal(result.value.changes.length, 1);
+  assert.equal(result.value.historyDeleted, null);
   assert.match(result.value.note, /untrusted data/);
   assert.equal(sdk.calls.length, 1);
   assert.equal(sdk.calls[0].actor, 'asUser');
