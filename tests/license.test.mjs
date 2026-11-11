@@ -152,7 +152,7 @@ test('the Rovo action refuses an unlicensed read before the visibility check', a
   }
 });
 
-test('filter events are recorded without a license, so a lapsed site keeps a complete history', async () => {
+test("the event handler never checks the license itself: Forge's manifest filter decides if it runs", async () => {
   const { storage, deps } = handlers({ environmentType: 'PRODUCTION', license: { active: false } });
   await createFilterEventHandler(deps)({
     eventType: 'avi:jira:created:filter',

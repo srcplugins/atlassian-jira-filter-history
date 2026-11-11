@@ -12,6 +12,8 @@ export interface OverviewRow {
 export interface DeletedRow extends OverviewRow {
   /** Only the deleted filter's last owner can open its history. */
   canOpen: boolean;
+  /** When the daily cleanup removes the deleted filter's history. */
+  expires: number;
 }
 export interface HistoryVersion {
   at: number;
@@ -65,7 +67,8 @@ export function readOverview(response: unknown) {
   )
     invalid();
   for (const row of value.filters) if (!isRow(row)) invalid();
-  for (const row of value.deleted) if (!isRow(row) || typeof row.canOpen !== 'boolean') invalid();
+  for (const row of value.deleted)
+    if (!isRow(row) || typeof row.canOpen !== 'boolean' || !isTime(row.expires)) invalid();
   return value as {
     filters: OverviewRow[];
     partial: boolean;
@@ -88,7 +91,12 @@ export function readHistory(response: unknown) {
     typeof value.more !== 'boolean' ||
     typeof value.admin !== 'boolean' ||
     (value.deleted !== null &&
-      (!isRecord(value.deleted) || !isTime(value.deleted.at) || !isAccount(value.deleted.actor)))
+      (!isRecord(value.deleted) ||
+        !isTime(value.deleted.at) ||
+        !isAccount(value.deleted.actor) ||
+        !isTime(value.deleted.expires))) ||
+    (value.cleared !== null &&
+      (!isRecord(value.cleared) || !isTime(value.cleared.at) || !isAccount(value.cleared.actor)))
   )
     invalid();
   for (const version of value.versions)
@@ -110,7 +118,9 @@ export function readHistory(response: unknown) {
     versions: HistoryVersion[];
     more: boolean;
     /** Set when the filter is deleted and the viewer, its owner, sees its kept history. */
-    deleted: { at: number; actor: string } | null;
+    deleted: { at: number; actor: string; expires: number } | null;
+    /** When and by whom an administrator last deleted the filter's earlier history. */
+    cleared: { at: number; actor: string } | null;
     admin: boolean;
   };
 }

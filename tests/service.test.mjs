@@ -5,6 +5,8 @@ import { memoryKvs } from './support/kvs.mjs';
 const { createService } = await import('../src/service.ts');
 const { createStore } = await import('../src/integration.ts');
 const { diffText, versionKey } = await import('../src/versions.ts');
+// A deleted filter's history is removed this long after the delete.
+const retention = 90 * 24 * 60 * 60 * 1000;
 
 const event = (at, filter = {}, extra = {}) => ({
   eventType: 'avi:jira:updated:filter',
@@ -239,26 +241,39 @@ test('events without an actor or a time are recorded; a dropped description is m
   assert.equal((await service.overview('owner')).deleted[0].actor, '');
 });
 
-test("a version whose description Jira didn't send is never restored or recreated", async () => {
-  const { service, jira } = setup();
+test("a version whose description Jira didn't send restores and recreates without it", async () => {
+  const { service, jira } = setup({ visible: { 10001: now({ description: 'kept', jql: 'c' }) } });
   await service.record(event(1000, { jql: 'a' }));
   await service.record({
     ...event(2000),
-    filter: without({ ...event(0).filter, jql: 'b' }, 'description'),
+    filter: without({ ...event(0).filter, name: 'Old bugs', jql: 'b' }, 'description'),
   });
   const { versions } = await service.history('10001', 'owner');
-  assert.deepEqual(versions[0].changed, ['jql'], 'an unknown description is no change');
+  assert.deepEqual(versions[0].changed, ['name', 'jql'], 'an unknown description is no change');
+  assert.equal((await service.changes('10001')).changes[0].after.description, null);
+  await service.restore({
+    filterId: '10001',
+    at: 2000,
+    expected: { name: 'Bugs', description: 'kept', jql: 'c' },
+  });
+  assert.deepEqual(jira.updates, [
+    ['10001', { ...jira.updates[0][1], name: 'Old bugs', description: 'kept', jql: 'b' }],
+  ]);
+  // Only the description differs from the filter now: there's nothing to restore.
+  jira.visible = { 10001: now({ name: 'Old bugs', description: 'kept', jql: 'b' }) };
   await assert.rejects(
-    service.restore({ filterId: '10001', at: 2000, expected }),
-    /didn't send this version's description/,
+    service.restore({
+      filterId: '10001',
+      at: 2000,
+      expected: { name: 'Old bugs', description: 'kept', jql: 'b' },
+    }),
+    /already matches/,
   );
   await service.record(deleteEvent(3000));
-  await assert.rejects(
-    service.recreate({ filterId: '10001', at: 2000 }, 'owner'),
-    /can't be recreated/,
-  );
-  assert.equal(jira.updates.length + jira.created.length, 0);
-  assert.equal((await service.changes('10001')).changes[0].after.description, null);
+  await service.recreate({ filterId: '10001', at: 2000 }, 'owner');
+  assert.equal(jira.created.length, 1);
+  assert.equal(jira.created[0].description, '');
+  assert.equal(jira.created[0].jql, 'b');
 });
 
 test('a deleted filter keeps its history for its last owner, and later events start none', async () => {
@@ -339,6 +354,41 @@ const deletedSetup = async (options) => {
   return context;
 };
 
+test('a late event never joins a history that is moving to a recreated filter', async () => {
+  for (const state of [
+    { recreatedAs: '30003' },
+    { recreating: { token: 'running', at: 2000, since: 1_000_000 } },
+  ]) {
+    const { service, storage, versions } = await deletedSetup();
+    const trash = storage.data.get('deleted:10001').trash;
+    storage.data.set(trash, { ...storage.data.get(trash), ...state });
+    await service.record(event(2500, { jql: 'late' }));
+    assert.deepEqual(
+      versions()
+        .filter(({ filterId }) => filterId === '10001')
+        .map(({ jql }) => jql),
+      ['type = Bug', 'old'],
+      Object.keys(state)[0],
+    );
+  }
+});
+
+test('a late event that repeats the newest version adds none after the delete', async () => {
+  const { service, versions } = await deletedSetup();
+  await service.record(event(2500));
+  assert.equal(versions().filter(({ filterId }) => filterId === '10001').length, 2);
+});
+
+test("a delete event without the owner keeps the history for the newest version's owner", async () => {
+  const { service } = setup({ visible: {} });
+  await service.record(event(1000));
+  await service.record(deleteEvent(2000, { owner: undefined }));
+  assert.deepEqual(
+    (await service.overview('owner')).deleted.map(({ owner }) => owner),
+    ['owner'],
+  );
+});
+
 test('deleted filters are listed to their owner, and all of them to an administrator', async () => {
   const { service, jira } = await deletedSetup();
   const row = (filterId, name, owner, at, canOpen) => ({
@@ -348,6 +398,7 @@ test('deleted filters are listed to their owner, and all of them to an administr
     at,
     actor: 'deleter',
     canOpen,
+    expires: at + retention,
   });
   assert.deepEqual((await service.overview('owner')).deleted, [
     row('10001', 'Bugs', 'owner', 3000, true),
@@ -374,7 +425,7 @@ test("a deleted filter's history opens read-only for its owner and for no one el
     owner: 'owner',
     isWritable: false,
   });
-  assert.deepEqual(history.deleted, { at: 3000, actor: 'deleter' });
+  assert.deepEqual(history.deleted, { at: 3000, actor: 'deleter', expires: 3000 + retention });
   assert.equal(history.admin, false);
   assert.deepEqual(
     history.versions.map(({ at, changed }) => [at, changed]),
@@ -508,6 +559,52 @@ test('an old claim with no filter in Jira is taken over; a refused create releas
   // Nothing was found under the owner's filters, so the create runs again, and Jira refuses it.
   await assert.rejects(service.recreate({ filterId: '10001', at: 2000 }, 'owner'));
   assert.equal(jira.created.length, 2);
+  // The refusal released the claim: a new try runs at once instead of waiting for it.
+  assert.equal(storage.data.get(trash).recreating, undefined);
+  jira.create = { status: 'applied', id: '30003' };
+  await service.recreate({ filterId: '10001', at: 2000 }, 'owner');
+  assert.equal(jira.created.length, 3);
+});
+
+test('a stalled recreate never takes over a matching filter the owner already had', async () => {
+  const { service, jira, clock } = await deletedSetup({ create: { status: 'uncertain' } });
+  // The owner made a filter by hand with the same name and query before recreating.
+  jira.own = [now({ id: '30001' })];
+  await assert.rejects(
+    service.recreate({ filterId: '10001', at: 2000 }, 'owner'),
+    /didn't confirm the new filter/,
+  );
+  clock.now += 31_000;
+  jira.create = { status: 'applied', id: '30005' };
+  assert.deepEqual(await service.recreate({ filterId: '10001', at: 2000 }, 'owner'), {
+    filterId: '30005',
+  });
+  assert.equal(jira.created.length, 2, 'nothing new was found, so the create runs again');
+});
+
+test('a stalled recreate adopts the first matching filter made after its claim', async () => {
+  const { service, jira, clock } = await deletedSetup({ create: { status: 'uncertain' } });
+  jira.own = [now({ id: '9' })];
+  await assert.rejects(service.recreate({ filterId: '10001', at: 2000 }, 'owner'));
+  clock.now += 31_000;
+  // The unconfirmed create made 99, then the owner copied it by hand as 100; IDs compare as
+  // numbers, not text.
+  jira.own = [now({ id: '9' }), now({ id: '100' }), now({ id: '99' }), now({ id: '8' })];
+  assert.deepEqual(await service.recreate({ filterId: '10001', at: 2000 }, 'owner'), {
+    filterId: '99',
+  });
+  assert.equal(jira.created.length, 1);
+});
+
+test('a claim that waited 29 seconds is still treated as running', async () => {
+  const { service, jira, clock } = await deletedSetup({ create: { status: 'uncertain' } });
+  await assert.rejects(service.recreate({ filterId: '10001', at: 2000 }, 'owner'));
+  clock.now += 29_000;
+  await assert.rejects(
+    service.recreate({ filterId: '10001', at: 2000 }, 'owner'),
+    /already being recreated/,
+  );
+  assert.equal(jira.created.length, 1);
 });
 
 test('two recreates at once make one Jira write; the other is told to wait', async () => {
@@ -570,19 +667,142 @@ test("administrators delete a deleted or visible filter's history; Jira isn't ch
     visible: { 10003: now({ id: '10003' }) },
   });
   await service.record(event(1000, { id: '10003' }));
-  await assert.rejects(service.deleteHistory('10002'), /Only Jira administrators/);
+  await assert.rejects(service.deleteHistory('10002', 'admin'), /Only Jira administrators/);
   jira.admin = true;
-  assert.deepEqual(await service.deleteHistory('10002'), { deleted: true });
-  assert.deepEqual(await service.deleteHistory('10003'), { deleted: true });
-  await assert.rejects(service.deleteHistory('10004'), /isn't available/);
-  await assert.rejects(service.deleteHistory('x'), /Choose a saved filter/);
-  assert.deepEqual(
-    [...storage.data.keys()].filter((key) => /1000[23]/.test(key)),
-    ['deleted:10002', 'expire:0000000004000:10002'],
-  );
+  assert.deepEqual(await service.deleteHistory('10002', 'admin'), { deleted: true });
+  assert.deepEqual(await service.deleteHistory('10003', 'admin'), { deleted: true });
+  await assert.rejects(service.deleteHistory('10004', 'admin'), /isn't available/);
+  await assert.rejects(service.deleteHistory('x', 'admin'), /Choose a saved filter/);
+  // A deleted filter's history goes without a trace: nobody can see that filter any more.
+  assert.deepEqual([...storage.data.keys()].filter((key) => /1000[23]/.test(key)).sort(), [
+    'cleared:10003',
+    'deleted:10002',
+    'expire:0000000004000:10002',
+  ]);
   assert.deepEqual(storage.data.get('deleted:10002'), { at: 4000 });
   assert.equal((await service.overview('admin')).deleted.length, 1);
   assert.equal(jira.updates.length + jira.created.length, 0);
+});
+
+test("deleting a visible filter's history records who deleted it and when, and nothing else", async () => {
+  const { service, jira, storage, clock } = setup({ admin: true });
+  await service.record(event(1000, { jql: 'old' }));
+  await service.record(event(2000));
+  assert.equal((await service.history('10001', 'viewer')).cleared, null);
+  clock.now = 5000;
+  // The record is written first, so a delete that stops part way still leaves it.
+  storage.failNext('batchDelete', 'version:10001:');
+  await assert.rejects(service.deleteHistory('10001', 'admin'));
+  assert.deepEqual(storage.data.get('cleared:10001'), { at: 5000, actor: 'admin' });
+  clock.now = 6000;
+  assert.deepEqual(await service.deleteHistory('10001', 'admin'), { deleted: true });
+  assert.deepEqual([...storage.data], [['cleared:10001', { at: 6000, actor: 'admin' }]]);
+  const history = await service.history('10001', 'viewer');
+  assert.deepEqual([history.versions, history.cleared], [[], { at: 6000, actor: 'admin' }]);
+  await service.record(event(7000, { jql: 'new' }));
+  assert.deepEqual((await service.history('10001', 'viewer')).cleared, {
+    at: 6000,
+    actor: 'admin',
+  });
+  assert.deepEqual((await service.changes('10001')).historyDeleted, {
+    at: new Date(6000).toISOString(),
+    actor: 'admin',
+  });
+  jira.visible = {};
+  await assert.rejects(service.history('10001', 'viewer'), /isn't available to you/);
+  await assert.rejects(service.changes('10001'), /isn't available to you/);
+});
+
+test('the record of a deleted history moves with a recreate and expires with the filter', async () => {
+  for (const finish of ['recreate', 'expire']) {
+    const { service, jira, storage, clock } = setup({ admin: true });
+    await service.record(event(1000, { jql: 'old' }));
+    clock.now = 1500;
+    await service.deleteHistory('10001', 'admin');
+    await service.record(event(2000));
+    await service.record(deleteEvent(3000));
+    jira.visible = {};
+    const cleared = { at: 1500, actor: 'admin' };
+    assert.deepEqual((await service.history('10001', 'owner')).cleared, cleared);
+    if (finish === 'expire') storage.failNext('transact', 'version:30003:');
+    await service.recreate({ filterId: '10001', at: 2000 }, 'owner').catch(() => undefined);
+    if (finish === 'expire') {
+      clock.now = 3000 + 90 * 24 * 60 * 60 * 1000;
+      await service.expire();
+    }
+    assert.ok(!storage.data.has('cleared:10001'), finish);
+    assert.deepEqual(storage.data.get('cleared:30003'), cleared, finish);
+  }
+  // A filter deleted for good loses it with the rest of its data.
+  const { service, jira, storage, clock } = setup({ admin: true });
+  await service.record(event(1000));
+  await service.deleteHistory('10001', 'admin');
+  await service.record(event(2000, { jql: 'new' }));
+  await service.record(deleteEvent(3000));
+  jira.visible = {};
+  clock.now = 3000 + 90 * 24 * 60 * 60 * 1000;
+  await service.expire();
+  assert.deepEqual([...storage.data], []);
+});
+
+test('a change made before a history was deleted never comes back in a late event', async () => {
+  const { service, jira, clock, versions } = setup({ admin: true });
+  await service.record(event(1000, { jql: 'old' }));
+  clock.now = 5000;
+  await service.deleteHistory('10001', 'admin');
+  await service.record(event(4000, { jql: 'retried' }));
+  assert.deepEqual(versions(), []);
+  await service.record(event(6000, { jql: 'new' }));
+  await service.record(event(4500, { jql: 'late' }));
+  assert.deepEqual(
+    versions().map(({ jql }) => jql),
+    ['new'],
+  );
+  // Nor once the filter is deleted, when a late change would otherwise join the kept history.
+  await service.record(deleteEvent(7000, { jql: 'new' }));
+  jira.visible = {};
+  await service.record(event(4800, { jql: 'later' }));
+  assert.deepEqual(
+    versions().map(({ jql }) => jql),
+    ['new'],
+  );
+});
+
+test('opening a deleted filter that finishes a stopped recreate moves the record too', async () => {
+  const { service, jira, storage, clock } = setup({ admin: true });
+  await service.record(event(1000, { jql: 'old' }));
+  clock.now = 1500;
+  await service.deleteHistory('10001', 'admin');
+  await service.record(event(2000));
+  await service.record(deleteEvent(3000));
+  jira.visible = {};
+  storage.failNext('set', 'cleared:30003');
+  await assert.rejects(service.recreate({ filterId: '10001', at: 2000 }, 'owner'));
+  jira.visible = { 30003: now({ id: '30003' }) };
+  const history = await service.history('10001', 'owner');
+  assert.equal(history.filter.id, '30003');
+  assert.deepEqual(history.cleared, { at: 1500, actor: 'admin' });
+  assert.ok(!storage.data.has('cleared:10001'));
+});
+
+test('a moved record never replaces a later one on the recreated filter', async () => {
+  const { service, jira, storage, clock } = setup({ admin: true });
+  await service.record(event(1000, { jql: 'old' }));
+  clock.now = 1500;
+  await service.deleteHistory('10001', 'admin');
+  await service.record(event(2000));
+  await service.record(deleteEvent(3000));
+  jira.visible = {};
+  storage.failNext('transact', 'version:30003:');
+  await assert.rejects(service.recreate({ filterId: '10001', at: 2000 }, 'owner'));
+  // An administrator deletes the recreated filter's history before the move finishes.
+  jira.visible = { 30003: now({ id: '30003' }) };
+  clock.now = 4000;
+  await service.deleteHistory('30003', 'other admin');
+  clock.now = 3000 + retention;
+  await service.expire();
+  assert.deepEqual(storage.data.get('cleared:30003'), { at: 4000, actor: 'other admin' });
+  assert.ok(!storage.data.has('cleared:10001'));
 });
 
 test("a hidden filter shows no history; its versions aren't read", async () => {
@@ -698,7 +918,7 @@ test('storage outages fail with a public message', async () => {
   const service = createService({ jira, store: createStore(storage) });
   await assert.rejects(service.history('10001', 'owner'), /App storage is unavailable/);
   await assert.rejects(service.overview('owner'), /App storage is unavailable/);
-  await assert.rejects(service.deleteHistory('10001'), /App storage is unavailable/);
+  await assert.rejects(service.deleteHistory('10001', 'admin'), /App storage is unavailable/);
 });
 
 const day = 24 * 60 * 60 * 1000;
@@ -722,6 +942,43 @@ test('a failed trim never fails recording; the next version removes the extra on
   assert.equal(versions().length, 102);
   await service.record(event(103_000, { jql: 'n = 103' }));
   assert.equal(versions().length, 101);
+});
+
+test('a late event and a moved history keep a filter at 101 versions', async () => {
+  const hundredAndOne = async () => {
+    const context = setup({ visible: {} });
+    for (let at = 2; at <= 102; at++)
+      await context.service.record(event(at * 1000, { jql: `n = ${at}` }));
+    await context.service.record(deleteEvent(200_000));
+    return context;
+  };
+  const count = (storage, filterId) =>
+    [...storage.data.keys()].filter((key) => key.startsWith(`version:${filterId}:`)).length;
+  const late = await hundredAndOne();
+  await late.service.record(event(1000, { jql: 'late' }));
+  assert.equal(count(late.storage, '10001'), 101, 'late event');
+  for (const finish of ['recreate', 'expire']) {
+    const { service, jira, storage, clock } = await hundredAndOne();
+    const create = jira.createFilter;
+    jira.createFilter = async (query) => {
+      // Jira's created event arrives before the history has moved.
+      await service.record(
+        event(
+          201_000,
+          { id: '30003', jql: 'new' },
+          { eventType: 'avi:jira:created:filter', selfGenerated: true },
+        ),
+      );
+      if (finish === 'expire') storage.failNext('transact', 'version:30003:');
+      return create(query);
+    };
+    await service.recreate({ filterId: '10001', at: 102_000 }, 'owner').catch(() => undefined);
+    if (finish === 'expire') {
+      clock.now = 200_000 + 90 * day;
+      await service.expire();
+    }
+    assert.equal(count(storage, '30003'), 101, finish);
+  }
 });
 
 test('a deleted filter and its history are removed 90 days after the delete, oldest first', async () => {

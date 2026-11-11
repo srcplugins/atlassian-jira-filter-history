@@ -52,7 +52,7 @@
     },
     {
       "id": "FH-06",
-      "behavior": "In Jira's issue search with a saved filter open, the apps menu's Filter history opens that filter's versions in a modal; without a saved filter it asks for one",
+      "behavior": "In Jira's issue search with a saved filter open, the apps menu's Filter History opens that filter's versions in a modal; without a saved filter it asks for one",
       "suite": "tests/hosted/filter-history.features.spec.mjs",
       "fixture": "Journaled administrator filter shared with the identity space, with two versions",
       "assertion": "The modal's history answer is for the open filter with both versions and its heading and two rows show; issue search without a saved filter shows \"Open a saved filter in Jira's search to see its history.\"",

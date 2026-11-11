@@ -47,21 +47,24 @@ const queryFields: Field[] = ['name', 'description', 'jql'];
 
 // Dates follow the viewer's Jira language and time zone, set once the product context loads.
 let dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+let dayFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
 function setJiraDates(locale: unknown, timeZone: unknown) {
   try {
-    dateFormat = new Intl.DateTimeFormat(
-      typeof locale === 'string' && locale ? locale.replace('_', '-') : undefined,
-      {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-        ...(typeof timeZone === 'string' && timeZone ? { timeZone } : {}),
-      },
-    );
+    const language = typeof locale === 'string' && locale ? locale.replace('_', '-') : undefined;
+    const zone = typeof timeZone === 'string' && timeZone ? { timeZone } : {};
+    dateFormat = new Intl.DateTimeFormat(language, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      ...zone,
+    });
+    dayFormat = new Intl.DateTimeFormat(language, { dateStyle: 'medium', ...zone });
   } catch {
     // An unknown language or zone keeps the browser's.
   }
 }
 const when = (at: number) => dateFormat.format(new Date(at));
+// The cleanup runs daily, so its dates have no time.
+const day = (at: number) => dayFormat.format(new Date(at));
 
 const failure = (error: unknown) =>
   error instanceof PublicResponseError ? error.message : 'Connection failed. Try again.';
@@ -250,18 +253,22 @@ function WhatChanged({
   version,
   previous,
   capped,
+  cleared,
 }: {
   version: HistoryVersion;
   previous: HistoryVersion | undefined;
   capped: boolean;
+  /** An administrator deleted the history before the versions shown. */
+  cleared: boolean;
 }) {
   if (!previous && !capped)
     return (
       <Stack space="space.150">
         <Heading as="h4">First recorded version</Heading>
         <Text size="small" color="color.text.subtle">
-          The app started recording this filter here. Changes made before the app was installed
-          aren&apos;t available.
+          {cleared
+            ? 'The app recorded this filter again from here, after an administrator deleted its earlier history.'
+            : "The app started recording this filter here. Changes made before the app was installed aren't available."}
         </Text>
         {queryFields.map((field) => (
           <FieldChange key={field} field={field} before={version} after={version} />
@@ -363,30 +370,26 @@ function IfRestored({
           <Text>{error}</Text>
         </SectionMessage>
       )}
-      {differences.length > 0 && version.descriptionMissing && (
-        <Text color="color.text.subtle">
-          Jira didn&apos;t send this version&apos;s description, so it can&apos;t be restored.
-        </Text>
-      )}
-      {differences.length > 0 && !version.descriptionMissing && !filter.isWritable && (
+      {differences.length > 0 && !filter.isWritable && (
         <Text color="color.text.subtle">
           You can&apos;t edit this filter, so you can&apos;t restore it.
         </Text>
       )}
-      {differences.length > 0 &&
-        !version.descriptionMissing &&
-        filter.isWritable &&
-        !confirming && (
-          <Box>
-            <Button autoFocus={cancelled} onClick={() => setConfirming(true)}>
-              Restore version
-            </Button>
-          </Box>
-        )}
+      {differences.length > 0 && filter.isWritable && !confirming && (
+        <Box>
+          <Button autoFocus={cancelled} onClick={() => setConfirming(true)}>
+            Restore version
+          </Button>
+        </Box>
+      )}
       {confirming && (
         <SectionMessage appearance="warning" title="Restore version?">
           <Stack space="space.100">
-            <Text>The filter&apos;s name, description and JQL change as shown above.</Text>
+            <Text>
+              {version.descriptionMissing
+                ? "The filter's name and JQL change as shown above. Its description stays as it is."
+                : "The filter's name, description and JQL change as shown above."}
+            </Text>
             <Inline space="space.100">
               <LoadingButton
                 appearance="warning"
@@ -460,11 +463,12 @@ function Recreate({
           <Text>{error}</Text>
         </SectionMessage>
       )}
-      {version.descriptionMissing ? (
-        <Text color="color.text.subtle">
-          Jira didn&apos;t send this version&apos;s description, so it can&apos;t be recreated.
+      {version.descriptionMissing && (
+        <Text size="small" color="color.text.subtle">
+          The new filter has no description.
         </Text>
-      ) : confirming ? (
+      )}
+      {confirming ? (
         <SectionMessage appearance="warning" title="Recreate this filter?">
           <Stack space="space.100">
             <Text>
@@ -565,6 +569,7 @@ function VersionDetail({
   capped,
   newest,
   deleted,
+  cleared,
   onRestored,
   onRecreated,
 }: {
@@ -574,6 +579,7 @@ function VersionDetail({
   capped: boolean;
   newest: boolean;
   deleted: boolean;
+  cleared: boolean;
   onRestored: () => void;
   /** Absent in Jira's search modal: a deleted filter is recreated from the app's page. */
   onRecreated: ((filterId: string) => void) | undefined;
@@ -589,7 +595,7 @@ function VersionDetail({
       </Inline>
       <Inline space="space.200" shouldWrap>
         <Box xcss={column}>
-          <WhatChanged version={version} previous={previous} capped={capped} />
+          <WhatChanged version={version} previous={previous} capped={capped} cleared={cleared} />
         </Box>
         <Box xcss={restoreColumn}>
           {deleted && !onRecreated ? (
@@ -688,7 +694,6 @@ function FilterHistory({
   const [selected, setSelected] = useState<number>();
   const [deleting, setDeleting] = useState(false);
   const [deleteCancelled, setDeleteCancelled] = useState(false);
-  const [historyDeleted, setHistoryDeleted] = useState(false);
   const [follow, setFollow] = useState<Follow | undefined>(
     recreatedAfter === undefined
       ? undefined
@@ -735,7 +740,7 @@ function FilterHistory({
         <LoadError message={history.error} onRetry={history.reload} />
       </Stack>
     );
-  const { filter, versions, more, deleted, admin } = history.value;
+  const { filter, versions, more, deleted, cleared, admin } = history.value;
   const chosen = versions.findIndex((version) => version.at === selected);
   const index = chosen >= 0 ? chosen : 0;
   const rows = versions.map((version, row) => ({
@@ -811,8 +816,8 @@ function FilterHistory({
               <User accountId={deleted.actor} />
             </Inline>
             <Text>
-              Only you, as its owner, can view this history. You can recreate the filter from any
-              version.
+              Only you, as its owner, can view this history and recreate the filter from any
+              version. The history is removed from {day(deleted.expires)}.
             </Text>
           </Stack>
         </SectionMessage>
@@ -831,21 +836,23 @@ function FilterHistory({
         <DeleteHistory
           filterId={filter.id}
           title={`Delete history for “${filter.name}”?`}
-          text={`This permanently deletes ${more ? 'all recorded versions' : `all ${count}`} of this filter for all users. The filter in Jira isn't changed, and its next change starts a new history. This can't be undone.`}
+          text={`This permanently deletes ${more ? 'all recorded versions' : `all ${count}`} of this filter for all users. The filter in Jira isn't changed, and its next change starts a new history. The history will show that you deleted it, and when. This can't be undone.`}
           onCancel={() => {
             setDeleting(false);
             setDeleteCancelled(true);
           }}
           onDeleted={() => {
             setDeleting(false);
-            setHistoryDeleted(true);
             history.reload();
           }}
         />
       )}
-      {historyDeleted && !versions.length && (
-        <SectionMessage appearance="success">
-          <Text>History deleted.</Text>
+      {cleared && (
+        <SectionMessage appearance="information" title="Earlier history deleted">
+          <Inline space="space.050" alignBlock="center" shouldWrap>
+            <Text>Deleted on {when(cleared.at)} by</Text>
+            <User accountId={cleared.actor} />
+          </Inline>
         </SectionMessage>
       )}
       {versions.length ? (
@@ -879,6 +886,7 @@ function FilterHistory({
           capped={more}
           newest={index === 0}
           deleted={deleted !== null}
+          cleared={cleared !== null}
           onRestored={() => {
             setFollow({
               action: 'restore',
@@ -1012,6 +1020,7 @@ function DeletedList({
             { key: 'owner', content: 'Owner' },
             { key: 'at', content: 'Deleted' },
             { key: 'actor', content: 'Deleted by' },
+            { key: 'expires', content: 'History removed from' },
             ...(admin ? [{ key: 'delete', content: 'Actions' }] : []),
           ],
         }}
@@ -1025,12 +1034,14 @@ function DeletedList({
                   {row.name}
                 </Button>
               ) : (
-                row.name
+                // Indented like a button's label so the names line up.
+                <Box paddingInline="space.150">{row.name}</Box>
               ),
             },
             { key: 'owner', content: row.owner ? <User accountId={row.owner} /> : '' },
             { key: 'at', content: when(row.at) },
             { key: 'actor', content: <User accountId={row.actor} /> },
+            { key: 'expires', content: day(row.expires) },
             ...(admin
               ? [
                   {

@@ -13,12 +13,15 @@ test('overview reader accepts only well-formed rows', () => {
   const valid = {
     filters: [row],
     partial: false,
-    deleted: [{ ...row, canOpen: true }],
+    deleted: [{ ...row, canOpen: true, expires: 2000 }],
     deletedPartial: false,
     admin: false,
   };
   assertEnvelopeReader(readOverview, valid, { filters: [{ ...row, name: 7 }] });
   assert.throws(() => readOverview({ ok: true, value: { ...valid, deleted: [row] } }));
+  assert.throws(() =>
+    readOverview({ ok: true, value: { ...valid, deleted: [{ ...row, canOpen: true }] } }),
+  );
   assert.throws(() => readOverview({ ok: true, value: { ...valid, admin: 'yes' } }));
 });
 
@@ -28,6 +31,7 @@ test('history reader accepts only well-formed versions', () => {
     versions: [{ at: 1000, actor: 'editor', ...query, ...flags, changed: ['jql'] }],
     more: false,
     deleted: null,
+    cleared: null,
     admin: false,
   };
   assertEnvelopeReader(readHistory, valid, {
@@ -37,15 +41,23 @@ test('history reader accepts only well-formed versions', () => {
     { more: 'no' },
     { admin: 1 },
     { deleted: { at: 2000 } },
+    { deleted: { at: 2000, actor: 'owner' } },
+    { cleared: undefined },
+    { cleared: { at: 2000 } },
+    { cleared: { at: '2000', actor: 'admin' } },
     { versions: [{ ...valid.versions[0], recreated: 'no' }] },
     { versions: [{ ...valid.versions[0], descriptionMissing: false }] },
   ])
     assert.throws(() => readHistory({ ok: true, value: { ...valid, ...change } }));
-  readHistory({ ok: true, value: { ...valid, deleted: { at: 2000, actor: 'owner' } } });
+  readHistory({
+    ok: true,
+    value: { ...valid, deleted: { at: 2000, actor: 'owner', expires: 3000 } },
+  });
   readHistory({
     ok: true,
     value: { ...valid, versions: [{ ...valid.versions[0], descriptionMissing: true }] },
   });
+  readHistory({ ok: true, value: { ...valid, cleared: { at: 2000, actor: 'admin' } } });
 });
 
 test('recreate and delete history readers accept only a confirmed result', () => {

@@ -13,6 +13,7 @@ import {
   openDeletedTab,
   openOverview,
   openSearchAction,
+  clickSearchAction,
   overviewWhen,
   redirectHistory,
   searchOverview,
@@ -348,7 +349,7 @@ test("FH-06 Jira's issue search opens the saved filter's history; without one it
   await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(2));
 
   const item = await openSearchAction(page, filter.id);
-  const history = await value(page, 'history', () => item.click());
+  const history = await value(page, 'history', () => clickSearchAction(page, item));
   expect(history.filter).toMatchObject({ id: filter.id, name, jql: filters.jql('b') });
   expect(jqls(history)).toEqual([filters.jql('b'), filters.jql('a')]);
   const modal = page.getByRole('dialog');
@@ -356,7 +357,7 @@ test("FH-06 Jira's issue search opens the saved filter's history; without one it
   await expect(versionRows(modal)).toHaveCount(2);
 
   const none = await openSearchAction(page);
-  await none.click();
+  await clickSearchAction(page, none);
   await expect(
     page
       .getByRole('dialog')
@@ -469,12 +470,25 @@ test("FH-07 a deleted filter's history stays for its owner, who recreates it; an
   ).toBeVisible();
   await member.getByRole('button', { name: 'Recreate filter', exact: true }).click();
   await expect(member.getByText('Recreate this filter?', { exact: true })).toBeVisible();
-  const recreated = await filters.recreated(owned, first, async () => {
-    const result = await value(member, 'recreate', () =>
-      member.getByRole('button', { name: 'Recreate filter', exact: true }).click(),
-    );
-    return result.filterId;
-  });
+  // With the member's default sharing for new filters set to all signed-in users, the recreated
+  // filter must still be private. The member's own setting is restored afterwards.
+  const scopePath = '/filter/defaultShareScope';
+  const scope = await jiraCall(filters.requests.member, scopePath);
+  expect(scope.status).toBe(200);
+  const shareScope = (setting) =>
+    jiraCall(filters.requests.member, scopePath, 'PUT', { scope: setting });
+  let recreated;
+  try {
+    expect((await shareScope('AUTHENTICATED')).status).toBe(200);
+    recreated = await filters.recreated(owned, first, async () => {
+      const result = await value(member, 'recreate', () =>
+        member.getByRole('button', { name: 'Recreate filter', exact: true }).click(),
+      );
+      return result.filterId;
+    });
+  } finally {
+    expect((await shareScope(scope.body.scope)).status).toBe(200);
+  }
   expect(recreated.id).not.toBe(owned.id);
   // Private: the owner reads it, the administrator doesn't see it.
   const hidden = await jiraCall(filters.requests.admin, `/filter/${recreated.id}`);
@@ -522,9 +536,19 @@ test("FH-07 a deleted filter's history stays for its owner, who recreates it; an
       page.getByRole('button', { name: 'Delete history', exact: true }).click(),
     ),
   ).toEqual({ deleted: true });
-  await expect(page.getByText('History deleted.', { exact: true })).toBeVisible();
+  // Only who deleted the history and when stays, shown to anyone who can see the filter.
+  await expect(page.getByText('Earlier history deleted', { exact: true })).toBeVisible();
   await expect(page.getByText('No changes recorded yet', { exact: true })).toBeVisible();
   expect(await jiraFilter(filters, live)).toEqual(before);
   overview = await openOverview(page);
   expect(overview.filters.some((r) => r.filterId === live.id)).toBe(false);
+  // The member, who can see the filter, sees the same record from Jira's search (the overview no
+  // longer lists it).
+  const item = await openSearchAction(member, live.id);
+  const cleared = await value(member, 'history', () => clickSearchAction(member, item));
+  expect(cleared.cleared).toMatchObject({ actor: ids.accounts.admin });
+  expect(cleared.versions).toEqual([]);
+  await expect(
+    member.getByRole('dialog').getByText('Earlier history deleted', { exact: true }),
+  ).toBeVisible();
 });

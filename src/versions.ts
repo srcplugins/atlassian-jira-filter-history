@@ -33,9 +33,17 @@ export interface Deleted {
   recreatedAs?: string;
   /**
    * Claimed before the Jira write of a recreate, so only one is made: the claim's token, the
-   * version it recreates and when it was claimed. Replaced by `recreatedAs` once Jira confirms.
+   * version it recreates, when it was claimed and the highest ID among the owner's filters with
+   * that name just before (a stalled recreate adopts only a filter made after it). Replaced by
+   * `recreatedAs` once Jira confirms.
    */
-  recreating?: { token: string; at: number; since: number };
+  recreating?: { token: string; at: number; since: number; above: string };
+}
+
+/** An administrator deleted a filter's recorded history: who and when, nothing of the filter. */
+export interface Cleared {
+  at: number;
+  actor: string;
 }
 
 /** Marks a deleted filter, pointing to its kept history's record while there is one. */
@@ -67,6 +75,7 @@ export const versionKey = (filterId: string, at: number) =>
 export const latestKey = (filterId: string) => `filter:${filterId}`;
 export const latestPrefix = 'filter:';
 export const deletedKey = (filterId: string) => `deleted:${filterId}`;
+export const clearedKey = (filterId: string) => `cleared:${filterId}`;
 // Deleted filters with kept history, most recently deleted first.
 export const trashPrefix = 'trash:';
 export const trashKey = (filterId: string, at: number) =>
