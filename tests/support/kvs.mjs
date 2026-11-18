@@ -1,5 +1,6 @@
 // In-memory substitute for the @forge/kvs calls the app makes: key order, prefix queries, pages,
-// cursors, transactions and batch deletes. `failing` makes every call throw, as an outage does;
+// cursors, transactions, batch deletes, a set that returns the value it replaced and one that
+// refuses an existing key. `failing` makes every call throw, as an outage does;
 // `failNext(call, key)` makes the next such call (on a key starting with `key`) fail once.
 export function memoryKvs({ failing = false } = {}) {
   const data = new Map();
@@ -22,9 +23,14 @@ export function memoryKvs({ failing = false } = {}) {
       guard('get', [key]);
       return clone(data.get(key));
     },
-    async set(key, value) {
+    async set(key, value, options) {
       guard('set', [key]);
+      // KVS refuses a FAIL_IF_EXISTS write to a key that has a value; expiry (`ttl`) isn't modelled.
+      if (options?.keyPolicy === 'FAIL_IF_EXISTS' && data.has(key)) throw Error('key exists');
+      const previous = clone(data.get(key));
       data.set(key, clone(value));
+      if (options?.returnValue === 'PREVIOUS' && previous !== undefined)
+        return { key, value: previous };
     },
     async delete(key) {
       guard('delete', [key]);
@@ -55,12 +61,18 @@ export function memoryKvs({ failing = false } = {}) {
           writes.push([key, clone(value)]);
           return builder;
         },
+        delete(key) {
+          writes.push([key, undefined]);
+          return builder;
+        },
         async execute() {
           guard(
             'transact',
             writes.map(([key]) => key),
           );
-          for (const [key, value] of writes) data.set(key, value);
+          for (const [key, value] of writes)
+            if (value === undefined) data.delete(key);
+            else data.set(key, value);
         },
       };
       return builder;
@@ -85,7 +97,7 @@ export function memoryKvs({ failing = false } = {}) {
           return builder;
         },
         async getMany() {
-          guard('query');
+          guard('query', [prefix]);
           const keys = [...data.keys()]
             .filter((key) => key.startsWith(prefix) && (after === undefined || key > after))
             .sort();

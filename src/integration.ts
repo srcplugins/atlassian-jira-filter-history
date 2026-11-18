@@ -1,4 +1,4 @@
-import type { FetchAPI } from '@forge/api';
+import type { FetchAPI, privacy as forgePrivacy } from '@forge/api';
 import type { kvs as forgeKvs, WhereConditions as ForgeWhereConditions } from '@forge/kvs';
 import { JiraHttpError, UserError, isDefinitiveRejection, jiraReader } from './shared/jira.mjs';
 import { needsConsent } from './shared/resolver.mjs';
@@ -15,8 +15,12 @@ export interface StoreDeps {
   WhereConditions: Pick<typeof ForgeWhereConditions, 'beginsWith'>;
 }
 
+export interface PrivacyDeps {
+  privacy: Pick<typeof forgePrivacy, 'reportPersonalData'>;
+}
+
 /** A filter as the viewer sees it in Jira now. */
-export interface CurrentFilter {
+interface CurrentFilter {
   id: string;
   name: string;
   description: string;
@@ -33,6 +37,9 @@ export type CreateOutcome =
   | { status: 'rejected'; message: string }
   | { status: 'uncertain' };
 
+/** A filter as the overview lists it: no query, which it doesn't show. */
+type ListedFilter = Pick<CurrentFilter, 'id' | 'name' | 'owner'>;
+
 type Query = Pick<CurrentFilter, 'name' | 'description' | 'jql'>;
 
 // Jira's filter search returns only filters the viewer can see. The app asks for 100 per page (the
@@ -40,24 +47,35 @@ type Query = Pick<CurrentFilter, 'name' | 'description' | 'jql'>;
 const searchPage = 100;
 const maxSearchPages = 10;
 
-function currentFilter(value: unknown): CurrentFilter {
-  if (
-    !isRecord(value) ||
-    !isFilterId(String(value.id ?? '')) ||
-    typeof value.name !== 'string' ||
-    typeof value.jql !== 'string' ||
-    (value.description !== undefined && typeof value.description !== 'string')
-  )
+/** A filter's ID, name and owner from a search; an owner Jira doesn't name is no one. */
+function listedFilter(value: unknown): ListedFilter {
+  if (!isRecord(value) || !isFilterId(String(value.id ?? '')) || typeof value.name !== 'string')
     throw new UserError('Jira returned unreadable data.');
   return {
     id: String(value.id),
     name: value.name,
-    description: value.description ?? '',
-    jql: value.jql,
     owner:
       isRecord(value.owner) && typeof value.owner.accountId === 'string'
         ? value.owner.accountId
         : '',
+  };
+}
+
+/** A filter with its query; a description Jira leaves out or sends as null is empty. */
+function currentFilter(value: unknown): CurrentFilter {
+  const listed = listedFilter(value);
+  if (
+    !isRecord(value) ||
+    typeof value.jql !== 'string' ||
+    (value.description !== undefined &&
+      value.description !== null &&
+      typeof value.description !== 'string')
+  )
+    throw new UserError('Jira returned unreadable data.');
+  return {
+    ...listed,
+    description: typeof value.description === 'string' ? value.description : '',
+    jql: value.jql,
     isWritable: value.isWritable === true,
   };
 }
@@ -69,7 +87,8 @@ function rejectionMessage(body: unknown) {
     ...(Array.isArray(body.errorMessages) ? body.errorMessages : []),
     ...(isRecord(body.errors) ? Object.values(body.errors) : []),
   ].filter((message): message is string => typeof message === 'string' && Boolean(message.trim()));
-  return messages.join(' ').slice(0, 500);
+  // The UI shows at most 500 characters of a public error, including the app's own words first.
+  return messages.join(' ').slice(0, 400);
 }
 
 async function readBody(response: { json: () => Promise<unknown> }) {
@@ -109,8 +128,8 @@ export function createJira({ api, route }: JiraDeps) {
    * Every filter a search returns, following Jira's pages until it says the last one came. A page
    * that is neither complete nor the last is unreadable, never "no more filters".
    */
-  async function search(params: URLSearchParams) {
-    const found: CurrentFilter[] = [];
+  async function search<T>(params: URLSearchParams, parse: (value: unknown) => T) {
+    const found: T[] = [];
     let startAt = 0;
     for (let page = 1; ; page++) {
       const paged = new URLSearchParams(params);
@@ -118,12 +137,31 @@ export function createJira({ api, route }: JiraDeps) {
       const body: unknown = await read(route`/rest/api/3/filter/search?${paged}`);
       if (!isRecord(body) || !Array.isArray(body.values) || typeof body.isLast !== 'boolean')
         throw new UserError('Jira returned unreadable data.');
-      found.push(...body.values.map(currentFilter));
+      found.push(...body.values.map(parse));
       if (body.isLast) return found;
       if (!body.values.length || page >= maxSearchPages)
         throw new UserError('Jira returned unreadable data.');
       startAt += body.values.length;
     }
+  }
+  /** The filters with these IDs that the viewer can see, keyed by ID, read with `expand`. */
+  async function byId<T extends { id: string }>(
+    ids: string[],
+    admin: boolean,
+    expand: string,
+    parse: (value: unknown) => T,
+  ) {
+    const searches = [];
+    for (let start = 0; start < ids.length; start += searchPage) {
+      const params = new URLSearchParams();
+      for (const id of ids.slice(start, start + searchPage)) params.append('id', id);
+      params.set('expand', expand);
+      params.set('maxResults', String(searchPage));
+      if (admin) params.set('overrideSharePermissions', 'true');
+      searches.push(search(params, parse));
+    }
+    // At most ten searches, sent together so a full overview fits the resolver's time.
+    return new Map((await Promise.all(searches)).flat().map((filter) => [filter.id, filter]));
   }
   return {
     /** Whether the viewer has Jira's Administer Jira permission. */
@@ -133,18 +171,15 @@ export function createJira({ api, route }: JiraDeps) {
         throw new UserError('Jira returned unreadable data.');
       return body.permissions.ADMINISTER.havePermission === true;
     },
-    /** The listed filters the viewer can see, keyed by ID; hidden and deleted ones are absent. */
-    async visibleFilters(ids: string[]) {
-      const visible = new Map<string, CurrentFilter>();
-      for (let start = 0; start < ids.length; start += searchPage) {
-        const params = new URLSearchParams();
-        for (const id of ids.slice(start, start + searchPage)) params.append('id', id);
-        params.set('expand', 'description,jql,owner,isWritable');
-        params.set('maxResults', String(searchPage));
-        for (const filter of await search(params)) visible.set(filter.id, filter);
-      }
-      return visible;
-    },
+    /**
+     * The listed filters the viewer can see, keyed by ID; hidden and deleted ones are absent. A
+     * Jira administrator (`admin`, checked by the caller) sees every filter, as Jira lets them
+     * with `overrideSharePermissions`; Jira refuses that flag to anyone else.
+     */
+    visibleFilters: (ids: string[], admin = false) =>
+      byId(ids, admin, 'description,jql,owner,isWritable', currentFilter),
+    /** The same, with only each filter's name and owner, for the overview. */
+    listedFilters: (ids: string[], admin = false) => byId(ids, admin, 'owner', listedFilter),
     /** The viewer's own filters named exactly `name` (Jira matches names partially). */
     async ownFilters(name: string, owner: string) {
       const params = new URLSearchParams({
@@ -154,7 +189,7 @@ export function createJira({ api, route }: JiraDeps) {
         expand: 'description,jql,owner,isWritable',
         maxResults: String(searchPage),
       });
-      return (await search(params)).filter(
+      return (await search(params, currentFilter)).filter(
         (filter) => filter.name === name && filter.owner === owner,
       );
     },
@@ -216,6 +251,8 @@ async function stored<T>(operation: () => Promise<T>) {
 // keys.
 const queryPage = 100;
 const deleteBatch = 25;
+// A transaction carries at most 4 MB; values are written in smaller groups.
+const transactionBytes = 3_000_000;
 
 export function createStore({ kvs, WhereConditions }: StoreDeps) {
   /** Up to `limit` values whose keys begin with `prefix`, in key order. */
@@ -234,33 +271,74 @@ export function createStore({ kvs, WhereConditions }: StoreDeps) {
     } while (cursor && values.length < limit);
     return values;
   }
+  /** Every value whose key begins with `prefix`, a query page at a time, in key order. */
+  async function* pages<T>(prefix: string) {
+    let cursor: string | undefined;
+    do {
+      let query = kvs.query().where('key', WhereConditions.beginsWith(prefix)).limit(queryPage);
+      if (cursor) query = query.cursor(cursor);
+      const page = await stored(() => query.getMany<T>());
+      yield page.results;
+      cursor = page.nextCursor;
+    } while (cursor);
+  }
   async function deleteKeys(keys: string[]) {
     for (let start = 0; start < keys.length; start += deleteBatch) {
       const batch = keys.slice(start, start + deleteBatch).map((key) => ({ key }));
       const result = await stored(() => kvs.batchDelete(batch));
-      if (result.failedKeys.length) throw new StorageUnavailable();
+      // A key already gone is what a delete wants.
+      if (result.failedKeys.some(({ error }) => error.code !== 'KEY_NOT_FOUND'))
+        throw new StorageUnavailable();
     }
   }
   return {
     get: <T>(key: string) => stored(() => kvs.get<T>(key)),
     set: <T>(key: string, value: T) => stored(() => kvs.set(key, value)),
-    /** All of up to 25 entries or none. */
-    async setTogether(entries: { key: string; value: unknown }[]) {
-      if (entries.length > deleteBatch) throw Error('A transaction takes at most 25 entries.');
+    /** All of up to 25 writes and deletes or none. */
+    async setTogether(entries: { key: string; value: unknown }[], deletes: string[] = []) {
+      if (entries.length + deletes.length > deleteBatch)
+        throw Error('A transaction takes at most 25 entries.');
       let transaction = kvs.transact();
       for (const { key, value } of entries) transaction = transaction.set(key, value);
+      for (const key of deletes) transaction = transaction.delete(key);
       await stored(() => transaction.execute());
     },
-    /** Writes the entries in transactions of up to 25. */
-    async setMany<T>(entries: { key: string; value: T }[]) {
-      for (let start = 0; start < entries.length; start += deleteBatch) {
-        let transaction = kvs.transact();
-        for (const { key, value } of entries.slice(start, start + deleteBatch))
-          transaction = transaction.set(key, value);
-        await stored(() => transaction.execute());
+    /**
+     * Writes the value only if the key is free; false when the key is taken or storage refused the
+     * write, which the caller tells apart with a get. Never with an expiry: KVS may keep an expired
+     * key for up to 48 hours, hidden from reads while still refusing this write.
+     */
+    async create<T>(key: string, value: T) {
+      try {
+        await kvs.set(key, value, { keyPolicy: 'FAIL_IF_EXISTS' });
+        return true;
+      } catch {
+        return false;
       }
     },
+    /** Writes the entries in transactions of up to 25 entries and about 3 MB. */
+    async setMany<T>(entries: { key: string; value: T }[]) {
+      let batch: { key: string; value: T }[] = [];
+      let size = 0;
+      const flush = async () => {
+        if (!batch.length) return;
+        let transaction = kvs.transact();
+        for (const { key, value } of batch) transaction = transaction.set(key, value);
+        batch = [];
+        size = 0;
+        await stored(() => transaction.execute());
+      };
+      for (const entry of entries) {
+        const bytes = Buffer.byteLength(JSON.stringify(entry.value));
+        if (batch.length === deleteBatch || (batch.length && size + bytes > transactionBytes))
+          await flush();
+        batch.push(entry);
+        size += bytes;
+      }
+      await flush();
+    },
     list,
+    pages,
     deleteKeys,
     delete: (key: string) => stored(() => kvs.delete(key)),
   };

@@ -10,12 +10,19 @@ export interface OverviewRow {
   actor: string;
 }
 export interface DeletedRow extends OverviewRow {
-  /** Only the deleted filter's last owner can open its history. */
-  canOpen: boolean;
   /** When the daily cleanup removes the deleted filter's history. */
   expires: number;
 }
+/** A version in the history's table: when, by whom and what it changed, without its texts. */
 export interface HistoryVersion {
+  at: number;
+  actor: string;
+  restored: boolean;
+  recreated: boolean;
+  changed: Field[];
+}
+/** A version's texts, loaded when it is opened. */
+export interface VersionText {
   at: number;
   actor: string;
   name: string;
@@ -26,7 +33,6 @@ export interface HistoryVersion {
   owner: string;
   restored: boolean;
   recreated: boolean;
-  changed: Field[];
 }
 export interface FilterNow {
   id: string;
@@ -39,8 +45,9 @@ export interface FilterNow {
 
 const isTime = (value: unknown): value is number =>
   typeof value === 'number' && Number.isInteger(value) && value > 0;
+// Jira caps a filter's name at 255 characters; its description and JQL have no documented limit.
 const isQuery = (value: Record<string, unknown>) =>
-  isText(value.name, 1000) && isText(value.description, 100_000) && isText(value.jql, 100_000);
+  isText(value.name, 1000) && isText(value.description, 2_000_000) && isText(value.jql, 2_000_000);
 const isAccount = (value: unknown) => isText(value, 200);
 
 function invalid(): never {
@@ -67,8 +74,7 @@ export function readOverview(response: unknown) {
   )
     invalid();
   for (const row of value.filters) if (!isRow(row)) invalid();
-  for (const row of value.deleted)
-    if (!isRow(row) || typeof row.canOpen !== 'boolean' || !isTime(row.expires)) invalid();
+  for (const row of value.deleted) if (!isRow(row) || !isTime(row.expires)) invalid();
   return value as {
     filters: OverviewRow[];
     partial: boolean;
@@ -89,12 +95,14 @@ export function readHistory(response: unknown) {
     typeof value.filter.isWritable !== 'boolean' ||
     !Array.isArray(value.versions) ||
     typeof value.more !== 'boolean' ||
+    typeof value.current !== 'boolean' ||
     typeof value.admin !== 'boolean' ||
     (value.deleted !== null &&
       (!isRecord(value.deleted) ||
         !isTime(value.deleted.at) ||
         !isAccount(value.deleted.actor) ||
-        !isTime(value.deleted.expires))) ||
+        !isTime(value.deleted.expires) ||
+        typeof value.deleted.canRecreate !== 'boolean')) ||
     (value.cleared !== null &&
       (!isRecord(value.cleared) || !isTime(value.cleared.at) || !isAccount(value.cleared.actor)))
   )
@@ -104,11 +112,8 @@ export function readHistory(response: unknown) {
       !isRecord(version) ||
       !isTime(version.at) ||
       !isAccount(version.actor) ||
-      !isQuery(version) ||
-      !isAccount(version.owner) ||
       typeof version.restored !== 'boolean' ||
       typeof version.recreated !== 'boolean' ||
-      (version.descriptionMissing !== undefined && version.descriptionMissing !== true) ||
       !Array.isArray(version.changed) ||
       !version.changed.every((field) => fields.includes(field as Field))
     )
@@ -117,12 +122,38 @@ export function readHistory(response: unknown) {
     filter: FilterNow;
     versions: HistoryVersion[];
     more: boolean;
-    /** Set when the filter is deleted and the viewer, its owner, sees its kept history. */
-    deleted: { at: number; actor: string; expires: number } | null;
+    /** The filter in Jira matches the newest version. */
+    current: boolean;
+    /**
+     * Set when the filter is deleted and the viewer, its owner or an administrator, sees its kept
+     * history; only the owner can recreate it.
+     */
+    deleted: { at: number; actor: string; expires: number; canRecreate: boolean } | null;
     /** When and by whom an administrator last deleted the filter's earlier history. */
     cleared: { at: number; actor: string } | null;
     admin: boolean;
   };
+}
+
+const isVersionText = (value: unknown): value is VersionText =>
+  isRecord(value) &&
+  isTime(value.at) &&
+  isAccount(value.actor) &&
+  isQuery(value) &&
+  isAccount(value.owner) &&
+  typeof value.restored === 'boolean' &&
+  typeof value.recreated === 'boolean' &&
+  (value.descriptionMissing === undefined || value.descriptionMissing === true);
+
+export function readVersion(response: unknown) {
+  const value = unwrapResponse(response);
+  if (
+    !isRecord(value) ||
+    !isVersionText(value.version) ||
+    (value.previous !== null && !isVersionText(value.previous))
+  )
+    invalid();
+  return value as { version: VersionText; previous: VersionText | null };
 }
 
 export function readRestore(response: unknown) {

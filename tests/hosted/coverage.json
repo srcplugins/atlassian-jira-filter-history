@@ -43,28 +43,28 @@
     },
     {
       "id": "FH-05",
-      "behavior": "A member's private filter and its history are visible to the member only: the administrator and the restricted user see neither, also by a direct history request",
+      "behavior": "A member's private filter and its history are hidden from the restricted user, also by a direct history request; a Jira administrator sees the filter in the overview and opens its history read-only",
       "suite": "tests/hosted/filter-history.features.spec.mjs",
       "fixture": "Journaled private filter owned by the member; a journaled shared administrator filter for the others to open",
-      "assertion": "The member's history shows the version; Jira refuses the filter to the administrator and the restricted account; their overview leaves it out; their history request rewritten to its ID answers \"This filter isn't available to you.\"",
+      "assertion": "The member's history shows the version; Jira refuses the filter to the administrator and the restricted account, and the administrator's override search finds it not editable; the administrator's overview lists it with its owner and the admin note, and its history opens with the version and no Restore version; the restricted user's overview leaves it out and their history request rewritten to its ID answers \"This filter isn't available to you.\"",
       "cleanup": "journal-verified",
       "lowerLevelTests": ["tests/service.test.mjs", "tests/boundary.test.mjs"]
     },
     {
       "id": "FH-06",
-      "behavior": "In Jira's issue search with a saved filter open, the apps menu's Filter History opens that filter's versions in a modal; without a saved filter it asks for one",
+      "behavior": "In Jira's search with a saved filter open, the apps menu's Filter History opens that filter's versions in a modal; without a saved filter it asks for one",
       "suite": "tests/hosted/filter-history.features.spec.mjs",
       "fixture": "Journaled administrator filter shared with the identity space, with two versions",
-      "assertion": "The modal's history answer is for the open filter with both versions and its heading and two rows show; issue search without a saved filter shows \"Open a saved filter in Jira's search to see its history.\"",
+      "assertion": "The modal's history answer is for the open filter with both versions and its heading and two rows show; Jira's search without a saved filter shows \"Open a saved filter in Jira's search to see its history.\"",
       "cleanup": "journal-verified",
       "lowerLevelTests": ["tests/client.test.mjs"]
     },
     {
       "id": "FH-07",
-      "behavior": "A deleted filter's history stays for its last owner, read-only under Deleted filters, and the owner recreates the filter from an earlier version as a new private filter that carries the history on; a Jira administrator sees deleted filters listed without a way in, deletes a deleted filter's history from the list and a visible filter's history from its screen, without changing Jira; a member gets no Delete history",
+      "behavior": "A deleted filter's history stays for its last owner, read-only under Deleted filters, and the owner recreates the filter from an earlier version as a new private filter that carries the history on, even with the owner's default sharing set to all signed-in users; a Jira administrator opens deleted filters' histories read-only without a recreate, deletes a deleted filter's history from the list and a visible filter's history from its screen, without changing Jira; a member gets no Delete history; after a deleted history, only who deleted it and when stays",
       "suite": "tests/hosted/filter-history.features.spec.mjs",
-      "fixture": "Two journaled private filters of the member, deleted by the journey through the journal; the filter the app recreates, journaled before the recreate with the deleted filter's marker; a journaled administrator filter shared with the identity space",
-      "assertion": "The member's overview lists both deleted filters as openable and the administrator's lists them without a link, the restricted user's not at all, and a history request rewritten to the deleted filter's ID answers \"This filter isn't available to you.\" for both; the administrator's Delete history removes the other deleted filter from the member's list; the member's history of the deleted filter is read-only with both versions; the recreate answers a new filter ID whose independent read as the member has the first version's query, no share or edit permissions and is refused to the administrator; the new filter's history has three versions, the newest marked recreated by the member; a member's history of the shared filter has no Delete history; after the administrator's Delete history the screen is empty, the overview drops the filter and Jira's read of it is unchanged",
+      "fixture": "Two journaled private filters of the member, deleted by the journey through the journal; the filter the app recreates, journaled before the recreate with the deleted filter's marker; a journaled administrator filter shared with the identity space; the member's default share scope, set to all signed-in users for the recreate and restored after it",
+      "assertion": "The member's overview lists both deleted filters as openable; the administrator's lists them and opens their history read-only with no Recreate filter; the restricted user's lists neither, and their history request rewritten to the deleted filter's ID answers \"This filter isn't available to you.\"; the administrator's Delete history removes the other deleted filter from the member's list; the member's history of the deleted filter is read-only with both versions; the recreate answers a new filter ID whose independent read as the member has the first version's query, no share or edit permissions and is refused to the administrator; the new filter's history has three versions, the newest marked recreated by the member; a member's history of the shared filter has no Delete history; after the administrator's Delete history the screen shows \"Earlier history deleted\" with who and when, the overview drops the filter, the member sees the same record, and Jira's read of the filter is unchanged",
       "cleanup": "journal-verified",
       "lowerLevelTests": [
         "tests/service.test.mjs",
@@ -82,8 +82,8 @@
       "script": "tests/hosted/verify-rovo.mjs",
       "optIn": "FH_ROVO_TESTS",
       "command": "FH_ROVO_TESTS=1 node tests/hosted/verify-rovo.mjs run (the full and release suites of forge-test.mjs)",
-      "fixture": "Journaled administrator filter shared with the identity space and changed once; journaled private filter of the member",
-      "assertion": "The Filter History agent's answer for the shared filter quotes its latest JQL; for the member's private filter it reports it unavailable without any of its JQL; independent reads show both filters unchanged",
+      "fixture": "Journaled administrator filter shared with the identity space and changed once; journaled private filters of the member and of the administrator",
+      "assertion": "The Filter History agent's answer for the shared filter quotes its latest JQL; the administrator's answer for the member's private filter quotes its JQL (administrators see every filter's history); the member's answer for the administrator's private filter, which Jira refuses to the member, reports it unavailable without any of its JQL; independent reads show every filter unchanged",
       "cleanup": "journal-verified; node tests/hosted/verify-rovo.mjs cleanup <run>",
       "version": "Unattended in the full and release suites",
       "lowerLevelTests": ["tests/rovo.test.mjs"]

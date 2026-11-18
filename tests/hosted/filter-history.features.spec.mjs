@@ -10,6 +10,7 @@ import { jiraCall, query, sharing } from './support/filters.mjs';
 import {
   answer,
   historyWhen,
+  historyWithTexts,
   openDeletedTab,
   openOverview,
   openSearchAction,
@@ -61,7 +62,9 @@ test('FH-01 each filter change is a version with its actor and time, in edit ord
   const name = nameOf(filter);
 
   // The create event is the first recorded version.
-  let history = await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(1));
+  let history = await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(1), {
+    texts: true,
+  });
   expect(history.filter).toMatchObject({ id: filter.id, name, jql: filters.jql('a') });
   expect(history.versions[0]).toMatchObject({
     jql: filters.jql('a'),
@@ -96,7 +99,9 @@ test('FH-01 each filter change is a version with its actor and time, in edit ord
   ).toPass({ timeout: 30_000, intervals: [1000, 2000] });
   const after = Date.now();
 
-  history = await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(2));
+  history = await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(2), {
+    texts: true,
+  });
   expect(history.versions[0]).toMatchObject({
     jql: edited.jql,
     actor: ids.accounts.admin,
@@ -105,31 +110,35 @@ test('FH-01 each filter change is a version with its actor and time, in edit ord
   expect(history.versions[0].at).toBeGreaterThan(before - skew);
   expect(history.versions[0].at).toBeLessThan(after + skew);
 
-  // Three JQL edits within about a second: three versions, in edit order.
-  const quick = ['c', 'd', 'e'].map((tag) => withJql(filters, filter, tag));
+  // A burst: five JQL edits in a row, about a second in all, so Jira's events arrive close together
+  // and possibly out of order. Each is a version, in edit order (Jira's change times), none lost or
+  // repeated.
+  const quick = ['c', 'd', 'e', 'f', 'g'].map((tag) => withJql(filters, filter, tag));
   for (const variant of quick) filters.allowQuery(filter, variant);
   const started = Date.now();
   for (const variant of quick) await filters.update(filter, 'admin', variant);
   const elapsed = Date.now() - started;
-  test.info().annotations.push({ type: 'three-edits-ms', description: String(elapsed) });
-  expect((await jiraFilter(filters, filter)).query).toEqual(quick[2]);
+  test.info().annotations.push({ type: 'five-edits-ms', description: String(elapsed) });
+  expect((await jiraFilter(filters, filter)).query).toEqual(quick[4]);
 
-  history = await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(5));
-  expect(jqls(history)).toEqual([...['e', 'd', 'c', 'b', 'a'].map((tag) => filters.jql(tag))]);
+  history = await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(7), {
+    texts: true,
+  });
+  expect(jqls(history)).toEqual(['g', 'f', 'e', 'd', 'c', 'b', 'a'].map((tag) => filters.jql(tag)));
   for (const version of history.versions) expect(version.actor).toBe(ids.accounts.admin);
   const times = history.versions.map((version) => version.at);
   expect([...times].sort((a, b) => b - a)).toEqual(times);
-  expect(new Set(times).size).toBe(5);
-  expect(times[0] - times[2]).toBeLessThanOrEqual(elapsed + 1000);
+  expect(new Set(times).size).toBe(7);
+  expect(times[0] - times[4]).toBeLessThanOrEqual(elapsed + 1000);
 
   // The newest version is shown, and its row highlighted, without choosing it: the label it
   // replaced struck through, the new one in bold, and no restore, since the filter matches it.
-  await expect(versionRows(page)).toHaveCount(5);
+  await expect(versionRows(page)).toHaveCount(7);
   await expect(versionRows(page).first().getByText('Current', { exact: true })).toBeVisible();
   await expect(versionRows(page).first()).toHaveAttribute(highlighted, 'true');
   await expect(page.getByRole('heading', { name: 'What changed', exact: true })).toBeVisible();
-  await expect(page.getByText(`fh${filters.short}d`, { exact: true })).toBeVisible();
-  await expect(page.getByText(`fh${filters.short}e`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`fh${filters.short}f`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`fh${filters.short}g`, { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Current version', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Restore version' })).toHaveCount(0);
 
@@ -172,7 +181,14 @@ test('FH-02 a sharing change and a save without changes add no version', async (
   // A real change afterwards is the second version: nothing was recorded in between.
   const changed = withJql(filters, filter, 'b');
   await filters.update(filter, 'admin', changed);
-  const history = await historyWhen(page, name, (h) => expect(h.versions[0].jql).toBe(changed.jql));
+  const history = await historyWhen(
+    page,
+    name,
+    (h) => expect(h.versions[0].jql).toBe(changed.jql),
+    {
+      texts: true,
+    },
+  );
   expect(jqls(history)).toEqual([filters.jql('b'), filters.jql('a')]);
   expect((await jiraFilter(filters, filter)).sharing).toEqual(shared);
 });
@@ -194,7 +210,9 @@ test('FH-03 a member with an edit share is the actor, restores a version, and a 
   // The member edits the administrator's filter through the edit share.
   const memberEdit = withJql(filters, filter, 'b');
   await filters.update(filter, 'member', memberEdit);
-  let history = await historyWhen(pages.member, name, (h) => expect(h.versions).toHaveLength(2));
+  let history = await historyWhen(pages.member, name, (h) => expect(h.versions).toHaveLength(2), {
+    texts: true,
+  });
   expect(history.filter.isWritable).toBe(true);
   expect(history.versions[0]).toMatchObject({
     jql: memberEdit.jql,
@@ -225,7 +243,9 @@ test('FH-03 a member with an edit share is the actor, restores a version, and a 
     query: filter.expected.variants[0],
     sharing: sharedWith,
   });
-  history = await historyWhen(pages.member, name, (h) => expect(h.versions).toHaveLength(3));
+  history = await historyWhen(pages.member, name, (h) => expect(h.versions).toHaveLength(3), {
+    texts: true,
+  });
   expect(history.versions[0]).toMatchObject({
     jql: filters.jql('a'),
     actor: ids.accounts.member,
@@ -283,7 +303,7 @@ test('FH-04 a user who can see but not edit a filter gets no restore, and Jira r
   });
 });
 
-test("FH-05 a member's private filter and its history are hidden from the administrator and the restricted user", async ({
+test("FH-05 an administrator sees a member's private filter read-only; the restricted user doesn't see it", async ({
   page,
   pages,
   filters,
@@ -298,8 +318,11 @@ test("FH-05 a member's private filter and its history are hidden from the admini
   const hiddenName = nameOf(hidden);
 
   // The member sees the private filter's history.
-  const own = await historyWhen(pages.member, hiddenName, (h) =>
-    expect(h.versions).toHaveLength(1),
+  const own = await historyWhen(
+    pages.member,
+    hiddenName,
+    (h) => expect(h.versions).toHaveLength(1),
+    { texts: true },
   );
   expect(own.versions[0]).toMatchObject({
     jql: filters.jql('p'),
@@ -307,34 +330,57 @@ test("FH-05 a member's private filter and its history are hidden from the admini
     owner: ids.accounts.member,
   });
 
-  for (const [role, viewer] of [
-    ['admin', page],
-    ['restricted', pages.restricted],
-  ]) {
-    // Jira hides the filter from them.
+  // Jira hides the filter from both by its sharing, while an administrator's search with Jira's
+  // override finds it, not editable.
+  for (const role of ['admin', 'restricted']) {
     const read = await jiraCall(filters.requests[role], `/filter/${hidden.id}`);
     expect(read.status, role).not.toBe(200);
-    // The overview leaves it out, while their own visible filter is listed.
-    await historyWhen(viewer, nameOf(visible), (h) => expect(h.versions).toHaveLength(1));
-    const overview = await openOverview(viewer);
-    expect(
-      overview.filters.some((row) => row.filterId === hidden.id),
-      role,
-    ).toBe(false);
-    await searchOverview(viewer, hiddenName);
-    await expect(viewer.getByText('No filter matches that name.', { exact: true })).toBeVisible();
-    // A direct request for its history is refused with the same answer as for any hidden filter.
-    await searchOverview(viewer, nameOf(visible));
-    const stop = await redirectHistory(viewer, hidden.id);
-    try {
-      const result = await answer(viewer, 'history', () =>
-        viewer.getByRole('button', { name: nameOf(visible), exact: true }).click(),
-      );
-      expect(result, role).toEqual({ ok: false, error: unavailable });
-      await expect(viewer.getByText(unavailable, { exact: true })).toBeVisible();
-    } finally {
-      await stop();
-    }
+  }
+  const override = await jiraCall(
+    filters.requests.admin,
+    `/filter/search?id=${hidden.id}&expand=isWritable&overrideSharePermissions=true`,
+  );
+  expect(override.body.values.map((f) => [f.id, f.isWritable])).toEqual([[hidden.id, false]]);
+
+  // The administrator's overview lists it, and its history opens read-only.
+  const overview = await openOverview(page);
+  expect(overview.admin).toBe(true);
+  expect(overview.filters.find((row) => row.filterId === hidden.id)).toMatchObject({
+    name: hiddenName,
+    owner: ids.accounts.member,
+  });
+  await expect(
+    page.getByText('As a Jira administrator, you see every filter, including private ones.', {
+      exact: false,
+    }),
+  ).toBeVisible();
+  await searchOverview(page, hiddenName);
+  const adminView = await historyWithTexts(page, () =>
+    page.getByRole('button', { name: hiddenName, exact: true }).click(),
+  );
+  expect(adminView.filter).toMatchObject({ id: hidden.id, isWritable: false });
+  expect(jqls(adminView)).toEqual([filters.jql('p')]);
+  await expect(page.getByRole('button', { name: 'Restore version' })).toHaveCount(0);
+
+  // The restricted user's overview leaves it out, while their own visible filter is listed.
+  const viewer = pages.restricted;
+  await historyWhen(viewer, nameOf(visible), (h) => expect(h.versions).toHaveLength(1));
+  const restricted = await openOverview(viewer);
+  expect(restricted.admin).toBe(false);
+  expect(restricted.filters.some((row) => row.filterId === hidden.id)).toBe(false);
+  await searchOverview(viewer, hiddenName);
+  await expect(viewer.getByText('No filter matches that name.', { exact: true })).toBeVisible();
+  // A direct request for its history is refused with the same answer as for any hidden filter.
+  await searchOverview(viewer, nameOf(visible));
+  const stop = await redirectHistory(viewer, hidden.id);
+  try {
+    const result = await answer(viewer, 'history', () =>
+      viewer.getByRole('button', { name: nameOf(visible), exact: true }).click(),
+    );
+    expect(result).toEqual({ ok: false, error: unavailable });
+    await expect(viewer.getByText(unavailable, { exact: true })).toBeVisible();
+  } finally {
+    await stop();
   }
 });
 
@@ -349,7 +395,7 @@ test("FH-06 Jira's issue search opens the saved filter's history; without one it
   await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(2));
 
   const item = await openSearchAction(page, filter.id);
-  const history = await value(page, 'history', () => clickSearchAction(page, item));
+  const history = await historyWithTexts(page, () => clickSearchAction(page, item));
   expect(history.filter).toMatchObject({ id: filter.id, name, jql: filters.jql('b') });
   expect(jqls(history)).toEqual([filters.jql('b'), filters.jql('a')]);
   const modal = page.getByRole('dialog');
@@ -397,33 +443,41 @@ test("FH-07 a deleted filter's history stays for its owner, who recreates it; an
     expect(row(owned)(o)).toMatchObject({ name: nameOf(owned), owner: ids.accounts.member });
     expect(row(gone)(o)).toBeTruthy();
   });
-  expect(row(owned)(overview)).toMatchObject({ actor: ids.accounts.member, canOpen: true });
+  expect(row(owned)(overview)).toMatchObject({ actor: ids.accounts.member });
   expect(overview.filters.some((r) => r.filterId === owned.id)).toBe(false);
 
-  // The administrator sees both listed, without a way into their history; the restricted user
-  // sees neither, and a direct request for the history is refused to both.
+  // The administrator sees both listed and opens their history read-only, without a recreate;
+  // the restricted user sees neither, and a direct request for the history is refused.
   overview = await openOverview(page);
   expect(overview.admin).toBe(true);
-  expect(row(owned)(overview)).toMatchObject({ canOpen: false, owner: ids.accounts.member });
+  expect(row(owned)(overview)).toMatchObject({ owner: ids.accounts.member });
+  expect(row(gone)(overview)).toBeTruthy();
   const table = await openDeletedTab(page);
   await searchOverview(page, nameOf(owned));
-  await expect(table.getByText(nameOf(owned), { exact: true })).toBeVisible();
-  await expect(table.getByRole('button', { name: nameOf(owned) })).toHaveCount(0);
+  const deletedView = await historyWithTexts(page, () =>
+    table.getByRole('button', { name: nameOf(owned), exact: true }).click(),
+  );
+  expect(deletedView.admin).toBe(true);
+  expect(deletedView.deleted).toMatchObject({ actor: ids.accounts.member, canRecreate: false });
+  expect(jqls(deletedView)).toEqual([second.jql, first.jql]);
+  await expect(page.getByText('This filter was deleted', { exact: true })).toBeVisible();
+  await viewVersion(page, 1);
+  await expect(
+    page.getByText("Only the filter's owner can recreate it.", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Recreate filter' })).toHaveCount(0);
   const restricted = await openOverview(pages.restricted);
   expect(restricted.admin).toBe(false);
   expect(row(owned)(restricted)).toBeUndefined();
-  for (const viewer of [page, pages.restricted]) {
-    await openOverview(viewer);
-    await searchOverview(viewer, nameOf(live));
-    const stop = await redirectHistory(viewer, owned.id);
-    try {
-      const result = await answer(viewer, 'history', () =>
-        viewer.getByRole('button', { name: nameOf(live), exact: true }).click(),
-      );
-      expect(result).toEqual({ ok: false, error: unavailable });
-    } finally {
-      await stop();
-    }
+  await searchOverview(pages.restricted, nameOf(live));
+  const stop = await redirectHistory(pages.restricted, owned.id);
+  try {
+    const result = await answer(pages.restricted, 'history', () =>
+      pages.restricted.getByRole('button', { name: nameOf(live), exact: true }).click(),
+    );
+    expect(result).toEqual({ ok: false, error: unavailable });
+  } finally {
+    await stop();
   }
 
   // The administrator deletes the other deleted filter's history from the list.
@@ -453,7 +507,7 @@ test("FH-07 a deleted filter's history stays for its owner, who recreates it; an
   // The member opens the deleted filter's history: read-only, marked deleted.
   await openDeletedTab(member);
   await searchOverview(member, nameOf(owned));
-  const history = await value(member, 'history', () =>
+  const history = await historyWithTexts(member, () =>
     member.getByRole('button', { name: nameOf(owned), exact: true }).click(),
   );
   expect(history.deleted).toMatchObject({ actor: ids.accounts.member });
@@ -502,10 +556,15 @@ test("FH-07 a deleted filter's history stays for its owner, who recreates it; an
   await expect(versionRows(member).first().getByText('Recreated', { exact: true })).toBeVisible();
 
   // Its history carries on: Jira's create event from the app's write is marked recreated.
-  const moved = await historyWhen(member, nameOf(owned), (h) => {
-    expect(h.filter.id).toBe(recreated.id);
-    expect(h.versions).toHaveLength(3);
-  });
+  const moved = await historyWhen(
+    member,
+    nameOf(owned),
+    (h) => {
+      expect(h.filter.id).toBe(recreated.id);
+      expect(h.versions).toHaveLength(3);
+    },
+    { texts: true },
+  );
   expect(moved.deleted).toBeNull();
   expect(moved.versions[0]).toMatchObject({
     jql: first.jql,

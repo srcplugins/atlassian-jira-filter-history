@@ -126,17 +126,74 @@ async function openFromOverview(page, name) {
   );
 }
 
+/** Views the version in row `index` and resolves with the texts the page loaded for it. */
+const viewTexts = (page, index) =>
+  value(page, 'version', () =>
+    versionRows(page)
+      .nth(index)
+      .getByRole('button', { name: 'View', exact: true })
+      .click({ timeout: 10_000 }),
+  );
+
+/**
+ * The history lists versions without their texts; the page loads a version's texts when it's
+ * viewed. Runs `exercise`, which opens a history, then views each listed version and resolves with
+ * the history the app loaded, each version's texts (name, description, JQL, owner) merged in. The
+ * newest version is selected again at the end, as when the history opened.
+ */
+export async function historyWithTexts(page, exercise) {
+  // The newest version's texts load as the history opens.
+  const newest = value(page, 'version', async () => undefined);
+  newest.catch(() => undefined);
+  const history = await value(page, 'history', exercise);
+  if (!history.versions.length) return history;
+  const texts = [await newest];
+  for (let index = 1; index < history.versions.length; index++)
+    texts.push(await viewTexts(page, index));
+  if (history.versions.length > 1) await viewTexts(page, 0);
+  return {
+    ...history,
+    versions: history.versions.map((summary, index) => {
+      // The texts loaded are the listed version's, not a neighbour's.
+      expect(texts[index].version.at).toBe(summary.at);
+      return { ...summary, ...texts[index].version };
+    }),
+  };
+}
+
+/**
+ * `historyWithTexts` in a second tab of the same signed-in context, so the journey's page keeps its
+ * selection.
+ */
+async function withTexts(page, name, listed) {
+  const tab = await page.context().newPage();
+  try {
+    await openOverview(tab);
+    await searchOverview(tab, name);
+    const history = await historyWithTexts(tab, () =>
+      tab.getByRole('button', { name, exact: true }).click({ timeout: 10_000 }),
+    );
+    // A version arrived in between: the caller's check runs again on a fresh look.
+    expect(history.versions.length).toBe(listed);
+    return history;
+  } finally {
+    await tab.close();
+  }
+}
+
 /**
  * Waits until the global page shows the filter with `check(history)` passing, reloading the page
- * between attempts: Jira delivers filter events a few seconds after the change.
+ * between attempts: Jira delivers filter events a few seconds after the change. With `texts`, each
+ * version also carries its name, description, JQL and owner, read as `withTexts` says.
  */
-export async function historyWhen(page, name, check, { timeout = 120_000 } = {}) {
+export async function historyWhen(page, name, check, { timeout = 120_000, texts = false } = {}) {
   /** @type {any} The last observed history, set inside the retried check. */
   let history;
   await expect(async () => {
     const overview = await openOverview(page);
     expect(overview.filters.some((row) => row.name === name)).toBe(true);
     history = await openFromOverview(page, name);
+    if (texts) history = await withTexts(page, name, history.versions.length);
     check(history);
   }).toPass({ timeout, intervals: [3000, 5000, 10_000] });
   return history;
