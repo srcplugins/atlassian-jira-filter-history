@@ -2,9 +2,10 @@
 //   FH_ROVO_TESTS=1 node tests/hosted/verify-rovo.mjs run            (a suite step)
 //   FH_ROVO_TESTS=1 node tests/hosted/verify-rovo.mjs cleanup <run>  (guarded recovery)
 // The administrator asks the Filter History agent what changed in a shared filter whose two
-// versions the app recorded, then about the member's private filter. The answer must carry the
-// latest JQL of the first and nothing of the second; Jira facts (independent reads) prove that
-// nothing changed. Filters are journaled fixtures (support/filters.mjs), always cleaned up.
+// versions the app recorded, then about the member's private filter: administrators see every
+// filter's history, so both answers carry the filter's JQL. The member then asks about the
+// administrator's private filter, which Jira hides from them: the answer must carry nothing of it.
+// Jira facts (independent reads) prove the visibility and that nothing changed. Filters are journaled fixtures (support/filters.mjs), always cleaned up.
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
@@ -12,7 +13,7 @@ import { chromium } from '@playwright/test';
 import { activeTarget, siteFor } from '@srcplugins/atlassian-forge-test-framework/core';
 import { tokenRequest } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { askRovo, openRovoChat } from '@srcplugins/atlassian-forge-test-framework/browser';
-import { filterRun, journalDirectory, query } from './support/filters.mjs';
+import { filterRun, jiraCall, journalDirectory, query } from './support/filters.mjs';
 import { historyWhen } from './support/app.mjs';
 import { expect } from './support/expect.mjs';
 
@@ -70,6 +71,15 @@ try {
         jql: filters.jql('p'),
         expectSharing: { share: [], edit: [] },
       });
+      const secret = await filters.filter('admin', {
+        name: `FH-08 admin private ${filters.short}`,
+        jql: filters.jql('s'),
+        expectSharing: { share: [], edit: [] },
+      });
+      // Jira hides the administrator's private filter from the member.
+      expect((await jiraCall(filters.requests.member, `/filter/${secret.id}`)).status).not.toBe(
+        200,
+      );
       // The app recorded both: the shared filter's two versions, the private filter's first.
       await historyWhen(admin, shared.expected.variants[0].name, (h) =>
         expect(h.versions).toHaveLength(2),
@@ -77,9 +87,13 @@ try {
       await historyWhen(member, hidden.expected.variants[0].name, (h) =>
         expect(h.versions).toHaveLength(1),
       );
+      await historyWhen(admin, secret.expected.variants[0].name, (h) =>
+        expect(h.versions).toHaveLength(1),
+      );
 
       const latestLabel = `fh${filters.short}b`;
       const privateLabel = `fh${filters.short}p`;
+      const secretLabel = `fh${filters.short}s`;
       const asked = (id) =>
         `What changed in saved filter ${id}? Quote the JQL of each change exactly.`;
       // Only the installation under test has this filter's history, so its answer picks the agent
@@ -94,23 +108,43 @@ try {
       evidence('shared', { filterId: shared.id, expected: latestLabel, answer });
       assert.ok(answer.includes(latestLabel), "The answer lacks the filter's latest JQL");
 
-      const refused = await askRovo(admin, asked(hidden.id));
-      evidence('private', { filterId: hidden.id, withheld: privateLabel, answer: refused });
-      assert.ok(!refused.includes(privateLabel), "The member's private filter leaked");
+      // Administrators see every filter's history, the member's private filter included.
+      const overridden = await askRovo(admin, asked(hidden.id));
+      evidence('admin-private', {
+        filterId: hidden.id,
+        expected: privateLabel,
+        answer: overridden,
+      });
+      assert.ok(
+        overridden.includes(privateLabel),
+        "The administrator didn't get the private filter",
+      );
+
+      // The member asks about the administrator's private filter, which Jira hides from them.
+      await openRovoChat(member, {
+        url: `${activeTarget().site}/jira/your-work`,
+        agent,
+        starter,
+        inventory: { prompt: asked(shared.id), matches: (text) => text.includes(latestLabel) },
+      });
+      const refused = await askRovo(member, asked(secret.id));
+      evidence('private', { filterId: secret.id, withheld: secretLabel, answer: refused });
+      assert.ok(!refused.includes(secretLabel), "The administrator's private filter leaked");
       assert.match(
         refused,
         /\b(?:not available|isn['’]t available|unavailable|not accessible|no access|can(?:no|['’])t (?:see|access|view)|don['’]t have access)\b/i,
       );
 
-      // Read-only: both filters are as the run left them.
+      // Read-only: every filter is as the run left them.
       assert.deepEqual(query(await filters.read(shared)), latest);
       assert.deepEqual(query(await filters.read(hidden)), hidden.expected.variants[0]);
+      assert.deepEqual(query(await filters.read(secret)), secret.expected.variants[0]);
       filters.run.check(
-        'Rovo answered the shared filter with its latest JQL and withheld the private one',
+        "Rovo answered the shared filter and, for the administrator, the member's private filter; it withheld the administrator's private filter from the member",
       );
       filters.run.state.testStatus = 'passed';
       console.log(
-        `Rovo ${filters.run.state.runId}: the agent quoted the shared filter's latest JQL, withheld the member's private filter, and Jira was unchanged.`,
+        `Rovo ${filters.run.state.runId}: the agent quoted the shared filter's latest JQL and, for the administrator, the member's private filter; it withheld the administrator's private filter from the member; Jira was unchanged.`,
       );
     } catch (error) {
       filters.run.state.testStatus = 'failed';

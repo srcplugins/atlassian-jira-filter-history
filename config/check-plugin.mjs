@@ -31,11 +31,14 @@ export function manifestFindings(source, nodeMajor) {
   if (manifest.providers?.auth) failures.push('External authentication needs explicit review.');
   if (manifest.app?.runtime?.name !== `nodejs${nodeMajor}.x`)
     failures.push(`Runtime must be nodejs${nodeMajor}.x to match .nvmrc.`);
-  // A paid app lets Forge skip background work for unlicensed sites (Forge standards).
+  // A paid app lets Forge skip background work for unlicensed sites, except the personal data
+  // report and retention cleanup, which run with or without a license (Forge standards).
+  const housekeeping = (type, key) =>
+    type === 'scheduledTrigger' && /-(privacy|cleanup)$/.test(String(key));
   if (manifest.app?.licensing?.enabled === true)
     for (const type of ['trigger', 'scheduledTrigger'])
       for (const module of manifest.modules?.[type] ?? [])
-        if (module?.filter?.appIsLicensed !== true)
+        if (module?.filter?.appIsLicensed !== true && !housekeeping(type, module?.key))
           failures.push(
             `${type} ${module?.key} must set filter.appIsLicensed: true in a paid app.`,
           );
@@ -216,7 +219,7 @@ export function hostTermFindings(appDir) {
 // rename and remove outright, and reinstall owned sites. Shared files serve released plugins too,
 // so they are checked where they are maintained.
 const compatWording =
-  /\b(legacy|backwards?|compat(?:ible|ibility)?|migrat\w*|(?:older|installed|previous) (?:versions?|builds?|installs?)|predates|permanent (?:key|id))\b/i;
+  /\b(legacy|deprecated|backwards?|compat(?:ible|ibility)?|migrat\w*|(?:older|installed|previous) (?:versions?|builds?|installs?)|predates|permanent (?:key|id))\b/i;
 export function compatFindings(appDir) {
   const version = JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')).version ?? '0';
   if (Number(version.split('.')[0]) >= 1 || !existsSync(join(appDir, 'src'))) return [];
@@ -385,6 +388,31 @@ export function handlerFindings(appDir) {
   return findings;
 }
 
+// A paid app checks its license with the shared helper, and its tests drive its entry points
+// through every license state, so an entry point that skips the check or refuses a licensed site
+// fails. A copied check drifts, and one no test drives can refuse everyone unnoticed.
+export function licenseFindings(appDir) {
+  const manifest = parseDocument(readFileSync(join(appDir, 'manifest.yml'), 'utf8')).toJS();
+  if (manifest?.app?.licensing?.enabled !== true) return [];
+  const findings = [];
+  if (!existsSync(join(appDir, 'src/shared/license.mjs')))
+    findings.push(
+      'src/shared/license.mjs is missing: a paid app checks its license with the shared helper (plugins adopt <slug> src/shared/license.mjs)',
+    );
+  const tests = existsSync(join(appDir, 'tests'))
+    ? readdirSync(join(appDir, 'tests')).filter((name) => name.endsWith('.test.mjs'))
+    : [];
+  if (
+    !tests.some((name) =>
+      readFileSync(join(appDir, 'tests', name), 'utf8').includes('./support/license-states.mjs'),
+    )
+  )
+    findings.push(
+      'tests: no test drives the entry points through tests/support/license-states.mjs, which a paid app needs',
+    );
+  return findings;
+}
+
 export const nodeMajor = (directory) =>
   readFileSync(join(directory, '.nvmrc'), 'utf8').trim().split('.')[0];
 
@@ -501,6 +529,7 @@ export function pluginFindings(appDir, { release = false } = {}) {
     ...compatFindings(appDir),
     ...themeFindings(appDir),
     ...handlerFindings(appDir),
+    ...licenseFindings(appDir),
     ...bundleHostFindings(appDir),
     ...publicRepositoryFindings(appDir),
     ...changelogFindings(appDir),
@@ -518,6 +547,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   if (findings.length) process.exitCode = 1;
   else
     console.log(
-      `Manifest defaults and handlers, ${release ? 'release' : 'dependency'} pins, README structure, host terms, pre-release compatibility, theme rules, bundle hosts, public-repository rules and the CHANGELOG passed.`,
+      `Manifest defaults, handlers and license check, ${release ? 'release' : 'dependency'} pins, README structure, host terms, pre-release compatibility, theme rules, bundle hosts, public-repository rules and the CHANGELOG passed.`,
     );
 }

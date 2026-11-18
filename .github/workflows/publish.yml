@@ -120,8 +120,11 @@ jobs:
           ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
           ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
         run: |
-          sed -i "s/^export const build = 'development';$/export const build = '${SHA::12}';/" src/build-info.ts
-          grep -q "'${SHA::12}'" src/build-info.ts || { echo "::error::Build stamp failed"; exit 1; }
+          # Only a plugin that shows its build carries src/build-info.ts.
+          if [ -f src/build-info.ts ]; then
+            sed -i "s/^export const build = 'development';$/export const build = '${SHA::12}';/" src/build-info.ts
+            grep -q "'${SHA::12}'" src/build-info.ts || { echo "::error::Build stamp failed"; exit 1; }
+          fi
           build="$TAG-${SHA::12}-$GITHUB_RUN_ID"
           node config/forge.mjs settings set usage-analytics false
           node config/forge.mjs build --tag "$build" --inspect --non-interactive

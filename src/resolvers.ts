@@ -47,12 +47,18 @@ export function registerResolvers({
   define('history', (payload, viewer) =>
     service.history(payloadField(payload, 'filterId'), viewer),
   );
+  define('version', (payload, viewer) => service.version(payload, viewer));
   define('restore', (payload) => service.restore(payload));
   define('recreate', (payload, viewer) => service.recreate(payload, viewer));
   // Removing stored history stays available without a license; nothing else does.
   define(
     'deleteHistory',
-    (payload, viewer) => service.deleteHistory(payloadField(payload, 'filterId'), viewer),
+    (payload, viewer) =>
+      service.deleteHistory(
+        payloadField(payload, 'filterId'),
+        payloadField(payload, 'deleted'),
+        viewer,
+      ),
     { needsLicense: false },
   );
   return resolver.getDefinitions();

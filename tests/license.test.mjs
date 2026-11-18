@@ -2,55 +2,14 @@ import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { forgeContract } from './support/forge-contract.mjs';
+import { licenseStates as states } from './support/license-states.mjs';
 import { memoryKvs } from './support/kvs.mjs';
 const { registerResolvers } = await import('../src/resolvers.ts');
 const { createRovoAction } = await import('../src/rovo.ts');
 const { createFilterEventHandler } = await import('../src/events.ts');
-const { licensed } = await import('../src/license.ts');
 
 const refusal =
   'Filter History for Jira has no active subscription on this site. A site administrator can subscribe in Atlassian Administration.';
-// License states as the Forge runtime reports them (`forge install --license <state>` in
-// development), and whether each one may use the app.
-const states = [
-  ['production, active', { environmentType: 'PRODUCTION', license: { active: true } }, true],
-  [
-    'production, trial',
-    { environmentType: 'PRODUCTION', license: { active: true, isEvaluation: true } },
-    true,
-  ],
-  ['production, inactive', { environmentType: 'PRODUCTION', license: { active: false } }, false],
-  ['production, no license', { environmentType: 'PRODUCTION' }, false],
-  ['production, null license', { environmentType: 'PRODUCTION', license: null }, false],
-  ['production, empty license', { environmentType: 'PRODUCTION', license: {} }, false],
-  [
-    'production, deprecated isActive',
-    { environmentType: 'PRODUCTION', license: { isActive: true } },
-    true,
-  ],
-  [
-    'production, active wins over isActive',
-    { environmentType: 'PRODUCTION', license: { active: false, isActive: true } },
-    false,
-  ],
-  [
-    'production, string active',
-    { environmentType: 'PRODUCTION', license: { active: 'true' } },
-    false,
-  ],
-  ['unknown environment, no license', {}, false],
-  ['development, no license', { environmentType: 'DEVELOPMENT' }, true],
-  ['staging, no license', { environmentType: 'STAGING' }, true],
-  [
-    'development, --license inactive',
-    { environmentType: 'DEVELOPMENT', license: { active: false } },
-    false,
-  ],
-];
-
-test('the license decides as Forge reports it; without one only development and staging pass', () => {
-  for (const [state, app, allowed] of states) assert.equal(licensed(app), allowed, state);
-});
 
 /**
  * Real handlers over the SDK double, with every storage access counted. Jira refuses each request
@@ -84,13 +43,14 @@ function handlers(app) {
 const requests = [
   ['overview', {}, true],
   ['history', { filterId: '10001' }, true],
+  ['version', { filterId: '10001', at: 1000 }, true],
   [
     'restore',
     { filterId: '10001', at: 1000, expected: { name: 'Bugs', description: '', jql: 'type = Bug' } },
     true,
   ],
   ['recreate', { filterId: '10001', at: 1000 }, true],
-  ['deleteHistory', { filterId: '10001' }, false],
+  ['deleteHistory', { filterId: '10001', deleted: false }, false],
 ];
 
 test('every resolver request is listed, so a new resolver needs a license decision', () => {
@@ -160,5 +120,7 @@ test("the event handler never checks the license itself: Forge's manifest filter
     timestamp: '1000',
     filter: { id: '10001', name: 'Bugs', description: '', jql: 'type = Bug', owner: 'owner' },
   });
-  assert.equal(storage.data.get('filter:10001').jql, 'type = Bug');
+  assert.deepEqual(storage.data.get('filter:10001').entries, [
+    { at: 1000, actor: 'editor', changed: [] },
+  ]);
 });

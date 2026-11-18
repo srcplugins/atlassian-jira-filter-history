@@ -8,9 +8,20 @@ import { memoryKvs } from './support/kvs.mjs';
 const { registerResolvers } = await import('../src/resolvers.ts');
 const { createCleanupHandler, createFilterEventHandler } = await import('../src/events.ts');
 
+/** The stored history, without the account registry the personal data report reads. */
+// Leaves out the personal data report's registry: account IDs and the filters that hold them.
+const stored = (storage) =>
+  [...storage.data].filter(([key]) => !key.startsWith('account:') && !key.startsWith('uses:'));
+const storedKeys = (storage) => stored(storage).map(([key]) => key);
+
 const context = { accountId: 'viewer' };
 const searchPath = (...ids) =>
   `/rest/api/3/filter/search?${ids.map((id) => `id=${id}&`).join('')}expand=description%2Cjql%2Cowner%2CisWritable&maxResults=100`;
+// The overview reads only each filter's name and owner.
+const listPath = (...ids) =>
+  `/rest/api/3/filter/search?${ids.map((id) => `id=${id}&`).join('')}expand=owner&maxResults=100`;
+// An administrator's search includes filters shared with no one but their owner.
+const overridePath = (...ids) => `${searchPath(...ids)}&overrideSharePermissions=true`;
 const adminPath = '/rest/api/3/mypermissions?permissions=ADMINISTER';
 const admin = (havePermission) => ({
   expect: { method: 'GET', path: adminPath },
@@ -57,19 +68,23 @@ async function handlers(...responses) {
 test('the trigger records events without any Jira request', async () => {
   const { sdk, storage } = await handlers();
   assert.equal(sdk.calls.length, 0);
-  assert.equal(storage.data.get('filter:10001').at, 2000);
+  assert.deepEqual(
+    storage.data.get('filter:10001').entries.map(({ at }) => at),
+    [1000, 2000],
+  );
 });
 
-test('overview and history make one exact asUser filter search and permission check', async () => {
+test('overview and history check the permission, then make one exact asUser filter search', async () => {
   const { sdk, resolvers } = await handlers(
-    { body: { isLast: true, values: [filter] } },
     admin(false),
     { body: { isLast: true, values: [filter] } },
     admin(true),
+    { body: { isLast: true, values: [filter] } },
   );
   assert.deepEqual(Object.keys(resolvers), [
     'overview',
     'history',
+    'version',
     'restore',
     'recreate',
     'deleteHistory',
@@ -96,20 +111,45 @@ test('overview and history make one exact asUser filter search and permission ch
   );
   assert.equal(history.value.admin, true);
   assert.deepEqual(sdk.calls, [
-    read(searchPath('10001')),
     read(adminPath),
-    read(searchPath('10001')),
+    read(listPath('10001')),
     read(adminPath),
+    read(overridePath('10001')),
   ]);
   sdk.assertDrained();
 });
 
+test('a filter Jira sends without JQL, or with a null description or owner, still lists and opens', async () => {
+  const bare = { id: '10001', name: 'Bugs', owner: null };
+  const { sdk, resolvers } = await handlers(
+    admin(false),
+    { body: { isLast: true, values: [bare] } },
+    admin(false),
+    { body: { isLast: true, values: [{ ...bare, jql: 'type = Bug', description: null }] } },
+  );
+  const overview = await resolvers.overview({ context });
+  assert.deepEqual(overview.value.filters, [
+    { filterId: '10001', name: 'Bugs', owner: '', at: 2000, actor: 'editor' },
+  ]);
+  const history = await resolvers.history({ context, payload: { filterId: '10001' } });
+  assert.deepEqual(history.value.filter, {
+    id: '10001',
+    name: 'Bugs',
+    description: '',
+    jql: 'type = Bug',
+    owner: '',
+    isWritable: false,
+  });
+  sdk.assertDrained();
+});
+
 test('an unreadable permission answer fails the overview, never treated as not an admin', async () => {
-  const { resolvers } = await handlers({ body: { isLast: true, values: [filter] } }, { body: {} });
+  const { sdk, resolvers } = await handlers({ body: {} });
   assert.deepEqual(await resolvers.overview({ context }), {
     ok: false,
     error: 'Jira returned unreadable data.',
   });
+  assert.deepEqual(sdk.calls, [read(adminPath)]);
 });
 
 const deleted = { ...event(3000, 'type = Bug'), eventType: 'avi:jira:deleted:filter' };
@@ -152,15 +192,20 @@ test('recreate makes one exact POST of a private filter and moves the history to
       }),
     },
   ]);
-  assert.equal(
-    [...storage.data.keys()].filter((key) => key.startsWith('version:10050:')).length,
-    2,
-  );
+  assert.equal(storedKeys(storage).filter((key) => key.startsWith('version:10050:')).length, 2);
 });
 
 test("an identity in the payload never opens, lists or recreates another user's deleted filter", async () => {
   const empty = { body: { isLast: true, values: [] } };
-  const { sdk, storage, resolvers } = await handlers(empty, admin(false), empty, admin(false));
+  // The deleted filter has no entry among the recently changed, so the overviews search nothing.
+  const { sdk, storage, resolvers } = await handlers(
+    admin(false),
+    empty,
+    admin(false),
+    admin(false),
+    empty,
+    admin(false),
+  );
   await createFilterEventHandler({
     ...sdk,
     kvs: storage.kvs,
@@ -230,21 +275,24 @@ test('delete history checks the permission, then the filter, and changes nothing
   const { sdk, storage, resolvers } = await handlers(admin(true), {
     body: { isLast: true, values: [filter] },
   });
-  assert.deepEqual(await resolvers.deleteHistory({ context, payload: { filterId: '10001' } }), {
-    ok: true,
-    value: { deleted: true },
-  });
-  assert.deepEqual(sdk.calls, [read(adminPath), read(searchPath('10001'))]);
+  assert.deepEqual(
+    await resolvers.deleteHistory({ context, payload: { filterId: '10001', deleted: false } }),
+    { ok: true, value: { deleted: true } },
+  );
+  assert.deepEqual(sdk.calls, [read(adminPath), read(overridePath('10001'))]);
   // Only who deleted the history and when stays, from the request's context.
-  assert.deepEqual([...storage.data.keys()], ['cleared:10001']);
+  assert.deepEqual(storedKeys(storage), ['cleared:10001']);
   assert.equal(storage.data.get('cleared:10001').actor, 'viewer');
   const denied = await handlers(admin(false));
   assert.deepEqual(
-    await denied.resolvers.deleteHistory({ context, payload: { filterId: '10001' } }),
+    await denied.resolvers.deleteHistory({
+      context,
+      payload: { filterId: '10001', deleted: false },
+    }),
     { ok: false, error: "Only Jira administrators can delete a filter's history." },
   );
   assert.equal(
-    [...denied.storage.data.keys()].filter((key) => key.startsWith('version:10001:')).length,
+    storedKeys(denied.storage).filter((key) => key.startsWith('version:10001:')).length,
     2,
   );
 });
@@ -291,6 +339,13 @@ test("a refused restore shows Jira's message; an unconfirmed one is never retrie
     ok: false,
     error: "Jira refused the restore: Field 'x' does not exist.",
   });
+  // A long refusal is cut so the whole message fits the UI's 500 characters.
+  const long = await handlers(
+    { body: { isLast: true, values: [filter] } },
+    { status: 400, body: { errorMessages: ['x'.repeat(2000)] } },
+  );
+  const cut = await long.resolvers.restore({ context, payload });
+  assert.equal(cut.error, `Jira refused the restore: ${'x'.repeat(400)}`);
   for (const failure of [{ status: 503 }, Error('private transport failure')]) {
     const unsure = await handlers({ body: { isLast: true, values: [filter] } }, failure, failure);
     const result = await unsure.resolvers.restore({ context, payload });
@@ -326,7 +381,8 @@ test('requests without a user or with a malformed filter fail before any SDK cal
     ['recreate', { context, payload: { filterId: '10001' } }],
     ['recreate', { context, payload: { filterId: '10001', at: 1000 } }],
     ['deleteHistory', { context, payload: { filterId: '' } }],
-    ['deleteHistory', { payload: { filterId: '10001' } }],
+    ['deleteHistory', { payload: { filterId: '10001', deleted: false } }],
+    ['deleteHistory', { context, payload: { filterId: '10001' } }],
   ]) {
     const { sdk, resolvers } = await handlers();
     assert.equal((await resolvers[name](request)).ok, false, `${name} ${JSON.stringify(request)}`);
@@ -344,11 +400,11 @@ test('denied and malformed filter searches fail at once; outages are read three 
     { body: {} },
   ]) {
     const outage = response instanceof Error || response.status === 503;
-    const { sdk, resolvers } = await handlers(response, response, response);
+    const { sdk, resolvers } = await handlers(admin(false), response, response, response);
     const result = await resolvers.history({ context, payload: { filterId: '10001' } });
     assert.equal(result.ok, false);
     assert.doesNotMatch(result.error, /PRIVATE/);
-    assert.equal(sdk.calls.length, outage ? 3 : 1);
+    assert.equal(sdk.calls.length, 1 + (outage ? 3 : 1));
   }
 });
 
@@ -369,12 +425,15 @@ test('a storage failure asks Forge to deliver the event again; a malformed event
   await record(event(1000, 'type = Bug'));
   storage.failNext('transact', 'deleted:10001');
   const retry = await record(deleted);
+  // The first retry comes after 30 seconds and up to 30 more, so retries of a burst spread out.
+  const { retryAfter } = retry.retryOptions;
+  assert.ok(retryAfter >= 30 && retryAfter < 60, String(retryAfter));
   assert.deepEqual(retry, {
     _retry: true,
-    retryOptions: { retryAfter: 30, retryReason: 'FUNCTION_RETRY_REQUEST', retryData: {} },
+    retryOptions: { retryAfter, retryReason: 'FUNCTION_RETRY_REQUEST', retryData: {} },
   });
   assert.ok(!storage.data.has('deleted:10001'));
-  assert.ok(![...storage.data.keys()].some((key) => key.startsWith('expire:')));
+  assert.ok(!storedKeys(storage).some((key) => key.startsWith('expire:')));
   assert.equal(await record(deleted), undefined);
   assert.ok(storage.data.get('deleted:10001').trash);
   assert.equal(await record({ eventType: 'avi:jira:updated:filter', filter: null }), undefined);
@@ -388,27 +447,39 @@ test('the daily cleanup touches only app storage and continues after a storage f
   await record(event(1000, 'type = Bug'));
   await record(deleted);
   const cleanup = createCleanupHandler(deps);
+  // A filter it couldn't remove fails the run with a count, and nothing of the filter.
   storage.failNext('get', 'deleted:10001');
-  assert.equal(await cleanup(), undefined);
+  await assert.rejects(cleanup(), (error) => {
+    assert.equal(
+      error.message,
+      "Cleanup couldn't remove 1 deleted filter's history. The next run tries again.",
+    );
+    return true;
+  });
   assert.ok(storage.data.has('deleted:10001'));
-  await cleanup();
-  assert.equal(storage.data.size, 0);
+  // So does a storage outage, after which the next run continues.
+  storage.failNext('query', 'expire:');
+  await assert.rejects(cleanup(), /^Error: Cleanup stopped: storage was unavailable\./);
+  assert.ok(storage.data.has('deleted:10001'));
+  assert.equal(await cleanup(), undefined);
+  assert.equal(stored(storage).length, 0);
   assert.equal(sdk.calls.length, 0);
 });
 
 test("the filter search follows Jira's pages and never reads a short page as hidden filters", async () => {
   const second = { ...filter, id: '10002', name: 'Second' };
   const paged = await handlers(
+    admin(false),
     { body: { isLast: false, values: [filter] } },
     { body: { isLast: true, values: [second] } },
   );
   await paged.resolvers.history({ context, payload: { filterId: '10001' } }).catch(() => {});
-  assert.deepEqual(paged.sdk.calls.map(({ path }) => path).slice(0, 2), [
+  assert.deepEqual(paged.sdk.calls.map(({ path }) => path).slice(1, 3), [
     searchPath('10001'),
     `${searchPath('10001')}&startAt=1`,
   ]);
   for (const page of [{ isLast: false, values: [] }, { values: [filter] }]) {
-    const { resolvers } = await handlers({ body: page });
+    const { resolvers } = await handlers(admin(false), { body: page });
     assert.deepEqual(await resolvers.history({ context, payload: { filterId: '10001' } }), {
       ok: false,
       error: 'Jira returned unreadable data.',
@@ -416,7 +487,7 @@ test("the filter search follows Jira's pages and never reads a short page as hid
   }
 });
 
-test('the overview searches 100 filters per request, in key order, plus one permission check', async () => {
+test('the overview checks the permission, then searches 100 filters per request, newest first', async () => {
   for (const [count, searches] of [
     [0, 0],
     [1, 1],
@@ -427,7 +498,7 @@ test('the overview searches 100 filters per request, in key order, plus one perm
     const pages = [];
     for (let start = 0; start < ids.length; start += 100)
       pages.push({ body: { isLast: true, values: [] } });
-    const sdk = forgeContract(...pages, admin(false));
+    const sdk = forgeContract(admin(false), ...pages);
     const deps = {
       ...sdk,
       kvs: storage.kvs,
@@ -435,17 +506,19 @@ test('the overview searches 100 filters per request, in key order, plus one perm
       appContext: () => ({ environmentType: 'DEVELOPMENT' }),
     };
     const record = createFilterEventHandler(deps);
-    for (const id of ids)
-      await record({ ...event(1000, 'type = Bug'), filter: { ...event(1000, 'x').filter, id } });
+    // Each filter changed after the one before it, so the newest comes first.
+    for (const [index, id] of ids.entries())
+      await record({ ...event(1000 + index, 'x'), filter: { ...event(0, 'x').filter, id } });
+    const newest = ids.toReversed();
     const overview = await registerResolvers(deps).overview({ context });
     assert.equal(overview.ok, true);
     assert.deepEqual(
       sdk.calls.map(({ path }) => path),
       [
-        ...Array.from({ length: searches }, (_, page) =>
-          searchPath(...ids.slice(page * 100, page * 100 + 100)),
-        ),
         adminPath,
+        ...Array.from({ length: searches }, (_, page) =>
+          listPath(...newest.slice(page * 100, page * 100 + 100)),
+        ),
       ],
       `${count} filters`,
     );

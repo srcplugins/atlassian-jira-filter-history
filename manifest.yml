@@ -28,8 +28,9 @@ modules:
     - key: filter-history-cleanup
       function: cleanup
       interval: day
-      filter:
-        appIsLicensed: true
+    - key: filter-history-privacy
+      function: privacy-report
+      interval: week
   rovo:agent:
     - key: filter-history-agent
       name: Filter History for Jira
@@ -63,6 +64,10 @@ modules:
       handler: index.filterEvent
     - key: cleanup
       handler: index.cleanup
+      timeoutSeconds: 300
+    - key: privacy-report
+      handler: index.privacyReport
+      timeoutSeconds: 900
     - key: rovo-changes
       handler: index.rovoChanges
 resources:
@@ -73,6 +78,7 @@ permissions:
     - read:jira-work
     - write:jira-work
     - manage:jira-configuration
+    - report:personal-data
     - storage:app
 app:
   id: ari:cloud:ecosystem::app/62065d94-e9fb-489a-be7e-31de5bf156ea
