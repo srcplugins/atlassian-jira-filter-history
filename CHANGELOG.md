@@ -2,6 +2,10 @@
 
 User-facing changes in each released version of Filter History for Jira.
 
+## 1.0.1 (unreleased)
+
+- Documentation: the README says history is kept with no time limit while the filter exists, that only the time is kept when an administrator deletes a deleted filter's history, and that the app keeps a list of the account IDs it stores for Atlassian's personal data report.
+
 ## 1.0.0
 
 - First release: a version history of each saved filter's name, description, JQL and owner, recorded from install, with who changed it and when.
