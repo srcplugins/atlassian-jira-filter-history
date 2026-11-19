@@ -121,8 +121,15 @@ test('FH-01 each filter change is a version with its actor and time, in edit ord
   test.info().annotations.push({ type: 'five-edits-ms', description: String(elapsed) });
   expect((await jiraFilter(filters, filter)).query).toEqual(quick[4]);
 
+  // The burst's events contend for the filter's lease. When app storage stalls, an invocation can
+  // reach Forge's 25-second limit holding the lease (seen 2026-11-18 with two suites on the site):
+  // Forge delivers it again later, and the events behind it wait out the lease's 60 seconds and
+  // Forge's retry backoff (30, then 120 seconds, plus jitter). The versions arrive late, not twice,
+  // so the wait covers one such stall.
+  test.setTimeout(600_000);
   history = await historyWhen(page, name, (h) => expect(h.versions).toHaveLength(7), {
     texts: true,
+    timeout: 300_000,
   });
   expect(jqls(history)).toEqual(['g', 'f', 'e', 'd', 'c', 'b', 'a'].map((tag) => filters.jql(tag)));
   for (const version of history.versions) expect(version.actor).toBe(ids.accounts.admin);

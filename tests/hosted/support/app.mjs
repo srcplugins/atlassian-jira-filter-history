@@ -219,8 +219,12 @@ export async function viewVersion(page, index) {
 export async function openSearchAction(page, filterId) {
   const path = filterId ? `/issues/?filter=${filterId}` : '/issues/?jql=';
   await page.goto(`${activeTarget().site}${path}`, { waitUntil: 'domcontentloaded' });
-  // Case-insensitive: Jira can keep showing a module's previous title for a while after a deploy.
-  const item = page.getByRole('menuitem', { name: /^Filter History/i });
+  // This installation's item only: Jira lists one per installed environment, and marks every one
+  // but production with a badge ("Filter History DEV"). Case-insensitive: Jira can keep showing a
+  // module's previous title for a while after a deploy.
+  const name =
+    target().environment === 'production' ? /^Filter History$/i : /^Filter History DEV$/i;
+  const item = page.getByRole('menuitem', { name });
   // Jira can paint the Apps button before its menu is ready; opening a menu writes nothing.
   await expect(async () => {
     if (!(await item.isVisible()))

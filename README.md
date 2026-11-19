@@ -41,7 +41,7 @@ Filter reads, restores and recreations respect Jira's user permissions. You can 
 | `write:jira-work` | Restore previous filter versions or recreate deleted filters as the current user. |
 | `manage:jira-configuration` | Receive filter events to record changes and deletions. |
 | `report:personal-data` | Report the stored account IDs to Atlassian each week, as its user privacy rules require, and learn which accounts were closed. |
-| `storage:app` | Store filter histories and deletion records. |
+| `storage:app` | Store filter histories and deletion records and, for Atlassian's personal data report, the account IDs it stores and which filters hold each. |
 
 ## Subscription
 
@@ -51,11 +51,11 @@ Without an active subscription, histories cannot be viewed, restored or recreate
 
 ## Data
 
-Filter History stores each recorded version's filter ID, name, description, JQL, owner, and who changed it and when in Atlassian Forge. Deleted filter records also include the last owner, who deleted the filter, and when. When an administrator deletes a filter's history, the app keeps who deleted it and when. Sharing and edit permissions are not recorded.
+Filter History stores each recorded version's filter ID, name, description, JQL, owner, and who changed it and when in Atlassian Forge. Deleted filter records also include the last owner, who deleted the filter, and when. When an administrator deletes the history of a filter still in Jira, the app keeps who deleted it and when; for a deleted filter, only the time of its delete stays. Sharing and edit permissions are not recorded.
 
 Each week the app reports the account IDs it stores to Atlassian. To do that, it keeps a list of those account IDs and of the filters whose records hold each one; an ID stays on the list until Atlassian reports the account closed. When an account is closed, its ID is removed from every record, and from the list a week later: its changes show an unknown user, and a deleted filter it owned can then be viewed only by Jira administrators, and recreated by no one. Account IDs written into a filter's JQL (such as `assignee = <account ID>`) are part of the query and stay as written.
 
-Each filter retains its latest 100 versions. Deleted filter histories are removed from 90 days after the delete, unless the filter is recreated or an administrator deletes the history sooner. Descriptions over 10,000 characters cannot be recorded or restored, and changes to a filter whose JQL is over 90,000 characters cannot be recorded, because Jira's filter events leave those fields out.
+Histories are kept while the filter exists and the app is installed, with no time limit: each filter retains its latest 100 versions. Saves without changes don't appear as versions. Deleted filter histories are removed from 90 days after the delete, unless the filter is recreated or an administrator deletes the history sooner. Descriptions over 10,000 characters cannot be recorded or restored, and changes to a filter whose JQL is over 90,000 characters cannot be recorded, because Jira's filter events leave those fields out.
 
 The app declares no external network access and does not log filter content. Uninstalling leaves Jira filters unchanged. Forge retains app data for 28 days after uninstall, but reinstalling does not automatically restore it.
 
